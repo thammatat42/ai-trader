@@ -1,0 +1,60 @@
+# ==========================================
+# AI Trader – Docker Compose (Full Stack)
+# ==========================================
+# Services:
+#   1. db         – PostgreSQL 16
+#   2. trader     – AI Trading Bot (xauusd_analyzer.py loop)
+#   3. dashboard  – Streamlit Admin Dashboard
+# ==========================================
+
+services:
+
+  # ---- PostgreSQL ----
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-admin}
+      POSTGRES_PASSWORD: ${DB_PASS:-secretpassword}
+      POSTGRES_DB: ${DB_NAME:-trading_log}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-admin} -d ${DB_NAME:-trading_log}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---- AI Trader Bot ----
+  trader:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=db         # override เพื่อให้ชี้ไปที่ container ชื่อ db
+    command: ["python", "-u", "xauusd_analyzer.py"]
+
+  # ---- Admin Dashboard (Streamlit) ----
+  dashboard:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=db
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "dashboard.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+
+volumes:
+  pgdata:
