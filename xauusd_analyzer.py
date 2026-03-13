@@ -5,7 +5,7 @@ import signal
 import traceback
 import requests
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,6 +37,44 @@ def get_db_connection():
         password=os.getenv("DB_PASS"),
         dbname=os.getenv("DB_NAME"),
     )
+
+
+# ==========================================
+# HELPER: เช็คตลาดเปิด/ปิด (XAUUSD)
+# ==========================================
+# XAUUSD Market Hours (UTC):
+#   เปิด  : Sunday  23:00 UTC  (= Monday 06:00 ICT)
+#   ปิด   : Friday  22:00 UTC  (= Saturday 05:00 ICT)
+#   พัก   : Daily   22:00-23:00 UTC (บาง Broker มี daily break)
+#   ปิด   : Saturday & Sunday (ยกเว้น Sunday 23:00+)
+# ==========================================
+def is_market_open() -> tuple[bool, str]:
+    """
+    เช็คว่าตลาด XAUUSD เปิดอยู่หรือไม่ (อิงเวลา UTC)
+    Return: (is_open: bool, reason: str)
+    """
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()   # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    hour = now.hour
+    minute = now.minute
+
+    # Saturday ทั้งวัน -> ปิด
+    if weekday == 5:
+        return False, "Saturday - market closed"
+
+    # Sunday ก่อน 23:00 UTC -> ปิด
+    if weekday == 6 and hour < 23:
+        return False, f"Sunday {hour:02d}:{minute:02d} UTC - market opens at 23:00 UTC"
+
+    # Friday หลัง 22:00 UTC -> ปิด
+    if weekday == 4 and hour >= 22:
+        return False, f"Friday {hour:02d}:{minute:02d} UTC - market closed for weekend"
+
+    # Daily break 22:00-23:00 UTC (Mon-Thu)
+    if hour == 22:
+        return False, f"Daily break {hour:02d}:{minute:02d} UTC - reopens at 23:00 UTC"
+
+    return True, "Market is open"
 
 
 # ==========================================
@@ -222,6 +260,100 @@ def save_log_to_db(symbol, bid, ask, ai_response, lot_size,
         print(f"[ERROR] Database Error: {e}")
 
 
+# ==========================================
+# 4.5  TRADE TRACKING – บันทึก & ซิงค์ trades table
+# ==========================================
+def save_trade_to_db(order_id, symbol, action, lot, open_price,
+                     sl_price, tp_price):
+    """บันทึก trade ใหม่ที่เพิ่งเปิดลง trades table (status=OPEN)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trades (order_id, symbol, action, lot, open_price,
+                                sl_price, tp_price, status, opened_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW())
+            ON CONFLICT (order_id) DO NOTHING;
+            """,
+            (order_id, symbol, action, lot, open_price, sl_price, tp_price),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[DB] 📝 บันทึก Trade #{order_id} → trades table (OPEN)")
+    except Exception as e:
+        print(f"[ERROR] save_trade_to_db: {e}")
+
+
+def sync_closed_trades():
+    """
+    ซิงค์สถานะ trade จาก MT5 (ผ่าน Windows VPS)
+    - ดึง history จาก /history
+    - อัปเดต trades ที่ปิดแล้ว (close_price, profit, status=CLOSED)
+    - ดึง open positions จาก /positions อัปเดต profit แบบ real-time
+    """
+    windows_ip = os.getenv("WINDOWS_IP")
+    if not windows_ip:
+        return
+
+    # --- ซิงค์ Closed Deals ---
+    try:
+        resp = http_session.get(f"http://{windows_ip}:8000/history?days=7", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        deals = data.get("deals", [])
+
+        if deals:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            for deal in deals:
+                cur.execute(
+                    """
+                    UPDATE trades
+                    SET close_price = %s,
+                        profit = %s,
+                        status = 'CLOSED',
+                        closed_at = to_timestamp(%s)
+                    WHERE order_id = %s AND status = 'OPEN';
+                    """,
+                    (deal["price"], deal["profit"], deal["time"], deal["order"]),
+                )
+            conn.commit()
+            updated = sum(1 for d in deals)
+            cur.close()
+            conn.close()
+            if updated:
+                print(f"[SYNC] 🔄 ซิงค์ {len(deals)} closed deals จาก MT5")
+    except Exception as e:
+        print(f"[SYNC] ⚠️ sync closed deals error: {e}")
+
+    # --- ซิงค์ Open Positions (อัปเดต unrealized P/L) ---
+    try:
+        resp = http_session.get(f"http://{windows_ip}:8000/positions", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        positions = data.get("positions", [])
+
+        if positions:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            for pos in positions:
+                cur.execute(
+                    """
+                    UPDATE trades
+                    SET profit = %s
+                    WHERE order_id = %s AND status = 'OPEN';
+                    """,
+                    (pos["profit"], pos["ticket"]),
+                )
+            conn.commit()
+            cur.close()
+            conn.close()
+    except Exception as e:
+        print(f"[SYNC] ⚠️ sync open positions error: {e}")
+
+
 def log_event(event_type: str, message: str):
     """บันทึกเหตุการณ์สำคัญลง bot_events"""
     try:
@@ -265,6 +397,7 @@ def check_bot_status():
 # MAIN LOOP – รันแบบ Background Service
 # ==========================================
 PAUSE_CHECK_SEC = 10          # เมื่อถูก Pause เช็คซ้ำทุก 10 วินาที
+MARKET_CLOSED_CHECK_SEC = 60  # เมื่อตลาดปิด เช็คซ้ำทุก 60 วินาที
 CONSECUTIVE_ERR_LIMIT = 5     # ผิดพลาดติดต่อกัน 5 ครั้ง -> หยุดอัตโนมัติ
 
 
@@ -273,8 +406,19 @@ def main_loop():
     log_event("START", "AI Trader service started")
 
     consecutive_errors = 0
+    _last_market_log = None   # ป้องกัน log spam ซ้ำทุกนาที
 
     while not _shutdown:
+        # ---- 0. เช็คตลาดเปิด/ปิด (ประหยัดค่า API) ----
+        market_open, market_reason = is_market_open()
+        if not market_open:
+            if _last_market_log != market_reason:
+                print(f"🌙 [MARKET CLOSED] {market_reason}")
+                _last_market_log = market_reason
+            time.sleep(MARKET_CLOSED_CHECK_SEC)
+            continue
+        _last_market_log = None
+
         # ---- 1. เช็ค Kill Switch / Breakpoint จาก Dashboard ----
         is_running, interval = check_bot_status()
 
@@ -328,12 +472,25 @@ def main_loop():
                 trade_result = send_trade_to_mt5(
                     action, symbol, lot_size, sl_points, tp_points, bid, ask
                 )
-                if trade_result:
+                if trade_result and trade_result.get("success"):
                     log_event("TRADE", f"{action} {symbol} Lot={lot_size} SL={sl_price} TP={tp_price}")
+                    # บันทึกลง trades table
+                    save_trade_to_db(
+                        order_id=trade_result["order_id"],
+                        symbol=symbol,
+                        action=action,
+                        lot=lot_size,
+                        open_price=trade_result.get("price", ask if action == "BUY" else bid),
+                        sl_price=sl_price,
+                        tp_price=tp_price,
+                    )
 
             # ---- 6. บันทึก Log ----
             save_log_to_db(symbol, bid, ask, analysis, lot_size,
                            trade_action=action, sl_price=sl_price, tp_price=tp_price)
+
+            # ---- 7. ซิงค์สถานะ Trade จาก MT5 ----
+            sync_closed_trades()
 
             consecutive_errors = 0  # รีเซ็ตเมื่อรอบนี้สำเร็จ
 
