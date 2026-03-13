@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS ai_analysis_log (
     ask             NUMERIC(12,5),
     ai_recommendation TEXT,
     lot_size        NUMERIC(6,2),
+    trade_action    VARCHAR(10)   DEFAULT 'WAIT',   -- BUY / SELL / WAIT
+    sl_price        NUMERIC(12,5),                   -- Stop Loss ราคาจริง
+    tp_price        NUMERIC(12,5),                   -- Take Profit ราคาจริง
     created_at      TIMESTAMP DEFAULT NOW()
 );
 

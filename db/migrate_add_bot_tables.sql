@@ -1,10 +1,15 @@
 -- ==========================================
--- MIGRATION: เพิ่มตาราง bot_settings และ bot_events
+-- MIGRATION: เพิ่มตาราง bot_settings, bot_events และ column ใหม่
 -- ==========================================
 -- ใช้สำหรับ Database ที่มีอยู่แล้ว (มี ai_analysis_log อยู่ก่อน)
 -- รันครั้งเดียวด้วยคำสั่ง:
 --   docker exec -i <db_container> psql -U admin -d trading_log < db/migrate_add_bot_tables.sql
 -- ==========================================
+
+-- เพิ่ม column ใหม่ใน ai_analysis_log (ถ้ายังไม่มี)
+ALTER TABLE ai_analysis_log ADD COLUMN IF NOT EXISTS trade_action VARCHAR(10) DEFAULT 'WAIT';
+ALTER TABLE ai_analysis_log ADD COLUMN IF NOT EXISTS sl_price NUMERIC(12,5);
+ALTER TABLE ai_analysis_log ADD COLUMN IF NOT EXISTS tp_price NUMERIC(12,5);
 
 -- ตาราง bot_settings
 CREATE TABLE IF NOT EXISTS bot_settings (
