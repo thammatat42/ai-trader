@@ -87,7 +87,7 @@ def run_command(sql, params=None):
 st.sidebar.title("🧭 Navigation")
 page = st.sidebar.radio(
     "เลือกหน้า",
-    ["🏠 Overview", "� Trade Reports", "�📈 Analysis Log", "🎛️ Bot Control", "📋 Event Log"],
+    ["🏠 Overview", "📊 Trade Reports", "📈 Analysis Log", "🎛️ Bot Control", "📋 Event Log"],
 )
 
 # Auto-refresh toggle
