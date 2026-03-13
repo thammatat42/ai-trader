@@ -175,6 +175,7 @@ def get_positions():
 def get_history(days: int = Query(default=7, ge=1, le=90)):
     """
     ดึง Trade History ย้อนหลัง (เฉพาะ magic=888888 ของ AI Bot)
+    ส่งทั้ง entry deals (เปิด) และ exit deals (ปิด)
     """
     if not ensure_mt5_connected():
         return {"error": "MT5 is not connected", "deals": []}
@@ -190,20 +191,26 @@ def get_history(days: int = Query(default=7, ge=1, le=90)):
     for d in deals:
         if d.magic != 888888:
             continue
-        if d.entry == mt5.DEAL_ENTRY_OUT or d.entry == mt5.DEAL_ENTRY_INOUT:
-            result.append({
-                "ticket": d.ticket,
-                "order": d.order,
-                "symbol": d.symbol,
-                "type": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
-                "lot": d.volume,
-                "price": d.price,
-                "profit": d.profit,
-                "swap": d.swap,
-                "commission": d.commission,
-                "time": d.time,
-                "comment": d.comment,
-            })
+        # Include both IN (open) and OUT (close) deals
+        entry_type = "IN" if d.entry == mt5.DEAL_ENTRY_IN else (
+            "OUT" if d.entry == mt5.DEAL_ENTRY_OUT else "INOUT"
+        )
+        if d.entry not in (mt5.DEAL_ENTRY_IN, mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT):
+            continue
+        result.append({
+            "ticket": d.ticket,
+            "order": d.order,
+            "symbol": d.symbol,
+            "type": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
+            "entry": entry_type,
+            "lot": d.volume,
+            "price": d.price,
+            "profit": d.profit,
+            "swap": d.swap,
+            "commission": d.commission,
+            "time": d.time,
+            "comment": d.comment,
+        })
 
     return {"deals": result, "count": len(result)}
 

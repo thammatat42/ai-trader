@@ -82,6 +82,122 @@ def run_command(sql, params=None):
 
 
 # ==========================================
+# MT5 API HELPER – ดึงข้อมูลจาก Windows VPS
+# ==========================================
+import requests as req_lib
+
+def mt5_api(endpoint: str, params: dict = None, timeout: int = 8):
+    """เรียก MT5 Bridge API บน Windows VPS"""
+    windows_ip = os.getenv("WINDOWS_IP", "")
+    if not windows_ip:
+        return None
+    try:
+        resp = req_lib.get(f"http://{windows_ip}:8000{endpoint}",
+                           params=params, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def sync_mt5_to_db():
+    """
+    ซิงค์ข้อมูลจาก MT5 → trades table ใน PostgreSQL
+    - /positions → UPSERT เป็น OPEN trades
+    - /history   → UPSERT เป็น CLOSED trades
+    """
+    synced = 0
+
+    # --- Sync Open Positions ---
+    pos_data = mt5_api("/positions")
+    if pos_data and pos_data.get("positions"):
+        for p in pos_data["positions"]:
+            try:
+                run_command(
+                    """
+                    INSERT INTO trades (order_id, symbol, action, lot, open_price,
+                                        sl_price, tp_price, profit, status, opened_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', to_timestamp(%s))
+                    ON CONFLICT (order_id) DO UPDATE SET
+                        profit = EXCLUDED.profit,
+                        sl_price = EXCLUDED.sl_price,
+                        tp_price = EXCLUDED.tp_price;
+                    """,
+                    (p["ticket"], p["symbol"], p["type"], p["lot"],
+                     p["open_price"], p["sl"], p["tp"], p["profit"], p["time"]),
+                )
+                synced += 1
+            except Exception:
+                pass
+
+    # --- Sync Closed Deals (last 30 days) ---
+    hist_data = mt5_api("/history", params={"days": 30})
+    if hist_data and hist_data.get("deals"):
+        # Separate IN (open) and OUT (close) deals, pair by order_id
+        in_deals = {}
+        out_deals = {}
+        for d in hist_data["deals"]:
+            if d.get("entry") == "IN":
+                in_deals[d["order"]] = d
+            elif d.get("entry") in ("OUT", "INOUT"):
+                out_deals[d["order"]] = d
+            else:
+                # Legacy format (no entry field) → treat as OUT
+                out_deals[d["order"]] = d
+
+        # UPSERT paired trades (have both open and close)
+        for order_id, out_deal in out_deals.items():
+            in_deal = in_deals.get(order_id, {})
+            open_price = in_deal.get("price")
+            open_time = in_deal.get("time", out_deal["time"])
+            # action = direction of the original open deal
+            action = in_deal.get("type", out_deal["type"])
+            try:
+                run_command(
+                    """
+                    INSERT INTO trades (order_id, symbol, action, lot,
+                                        open_price, close_price,
+                                        profit, status, opened_at, closed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'CLOSED',
+                            to_timestamp(%s), to_timestamp(%s))
+                    ON CONFLICT (order_id) DO UPDATE SET
+                        open_price = COALESCE(EXCLUDED.open_price, trades.open_price),
+                        close_price = EXCLUDED.close_price,
+                        profit = EXCLUDED.profit,
+                        status = 'CLOSED',
+                        closed_at = EXCLUDED.closed_at;
+                    """,
+                    (order_id, out_deal["symbol"], action, out_deal["lot"],
+                     open_price, out_deal["price"],
+                     out_deal["profit"], open_time, out_deal["time"]),
+                )
+                synced += 1
+            except Exception:
+                pass
+
+    # --- Mark positions closed if they disappeared from MT5 ---
+    if pos_data is not None:
+        open_tickets = [p["ticket"] for p in pos_data.get("positions", [])]
+        if open_tickets:
+            placeholders = ",".join(["%s"] * len(open_tickets))
+            run_command(
+                f"""
+                UPDATE trades SET status = 'CLOSED', closed_at = NOW()
+                WHERE status = 'OPEN' AND order_id NOT IN ({placeholders});
+                """,
+                tuple(open_tickets),
+            )
+        else:
+            # No open positions at all → close all OPEN in DB
+            run_command(
+                "UPDATE trades SET status = 'CLOSED', closed_at = NOW() WHERE status = 'OPEN';"
+            )
+
+    return synced
+
+
+# ==========================================
 # SIDEBAR – NAVIGATION
 # ==========================================
 st.sidebar.title("🧭 Navigation")
@@ -203,18 +319,15 @@ if page == "🏠 Overview":
 elif page == "📊 Trade Reports":
     st.title("📊 Trade Reports – Pro Dashboard")
 
+    # ----- SYNC MT5 → DB on page load -----
+    windows_ip = os.getenv("WINDOWS_IP", "")
+
+    with st.spinner("🔄 กำลังซิงค์ข้อมูลจาก MT5..."):
+        synced_count = sync_mt5_to_db()
+
     # ----- ACCOUNT INFO (Live from MT5) -----
     st.subheader("💰 Account Overview")
-    windows_ip = os.getenv("WINDOWS_IP", "")
-    account_info = None
-    if windows_ip:
-        try:
-            import requests as req_lib
-            acc_resp = req_lib.get(f"http://{windows_ip}:8000/account", timeout=5)
-            if acc_resp.status_code == 200:
-                account_info = acc_resp.json()
-        except Exception:
-            pass
+    account_info = mt5_api("/account")
 
     if account_info and "balance" in account_info:
         ac1, ac2, ac3, ac4, ac5 = st.columns(5)
@@ -231,24 +344,37 @@ elif page == "📊 Trade Reports":
 
     st.divider()
 
-    # ----- OPEN POSITIONS (Live) -----
+    # ----- OPEN POSITIONS (Live from MT5 API) -----
     st.subheader("📌 Open Positions")
-    open_trades = run_query(
-        "SELECT * FROM trades WHERE status = 'OPEN' ORDER BY opened_at DESC;"
-    )
-    if open_trades:
-        df_open = pd.DataFrame(open_trades)
-        total_unrealized = sum(float(t.get("profit") or 0) for t in open_trades)
+    pos_data = mt5_api("/positions")
+    if pos_data and pos_data.get("positions"):
+        positions = pos_data["positions"]
+        total_unrealized = sum(p.get("profit", 0) for p in positions)
         oc1, oc2 = st.columns(2)
-        oc1.metric("Open Trades", len(open_trades))
+        oc1.metric("Open Trades", len(positions))
         oc2.metric("Unrealized P/L", f"${total_unrealized:+,.2f}",
+                    delta=f"${total_unrealized:+,.2f}",
                     delta_color="normal")
-        display_cols = ["order_id", "symbol", "action", "lot", "open_price",
-                        "sl_price", "tp_price", "profit", "opened_at"]
-        existing_cols = [c for c in display_cols if c in df_open.columns]
-        st.dataframe(df_open[existing_cols], use_container_width=True)
+        df_pos = pd.DataFrame(positions)
+        display_cols = ["ticket", "symbol", "type", "lot", "open_price",
+                        "current_price", "sl", "tp", "profit", "swap"]
+        existing_cols = [c for c in display_cols if c in df_pos.columns]
+        st.dataframe(df_pos[existing_cols], use_container_width=True)
     else:
-        st.info("ไม่มี Open Position ขณะนี้")
+        # Fallback to DB
+        open_trades = run_query(
+            "SELECT * FROM trades WHERE status = 'OPEN' ORDER BY opened_at DESC;"
+        )
+        if open_trades:
+            df_open = pd.DataFrame(open_trades)
+            total_unrealized = sum(float(t.get("profit") or 0) for t in open_trades)
+            oc1, oc2 = st.columns(2)
+            oc1.metric("Open Trades", len(open_trades))
+            oc2.metric("Unrealized P/L", f"${total_unrealized:+,.2f}",
+                        delta_color="normal")
+            st.dataframe(df_open, use_container_width=True)
+        else:
+            st.info("ไม่มี Open Position ขณะนี้")
 
     st.divider()
 
@@ -600,7 +726,7 @@ elif page == "🎛️ Bot Control":
 
     # --- Kill Switch ---
     st.subheader("🔴 Kill Switch / Start-Stop")
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
 
     with col_a:
         if s["is_running"]:
@@ -622,12 +748,28 @@ elif page == "🎛️ Bot Control":
                 )
                 st.rerun()
 
+    with col_c:
+        st.info("🔄 Restart = Stop + Start")
+        if st.button("🔄 RESTART BOT", use_container_width=True):
+            run_command("UPDATE bot_settings SET is_running = TRUE, updated_at = NOW();")
+            run_command(
+                "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
+                ("RESTART", "Bot restarted from Dashboard"),
+            )
+            st.success("✅ Bot ถูกรีสตาร์ท – กำลังกลับมาทำงาน")
+            st.rerun()
+
     st.divider()
 
     # --- Settings ---
     st.subheader("⚙️ Bot Settings")
 
+    # ดึงค่าปัจจุบัน (รองรับ column ใหม่)
+    current_max_retries = s.get("pause_max_retries", 5)
+    current_retry_sec = s.get("pause_retry_sec", 10)
+
     with st.form("settings_form"):
+        st.markdown("##### ⏱️ Trading Interval")
         new_interval = st.selectbox(
             "Interval (วินาที)",
             options=[60, 120, 300, 600, 900, 1800, 3600],
@@ -648,18 +790,35 @@ elif page == "🎛️ Bot Control":
             "Max Trades / Day", min_value=1, max_value=100, value=s["max_trades_per_day"]
         )
 
+        st.markdown("##### ⏸️ Breakpoint / Pause Settings")
+        bp_col1, bp_col2 = st.columns(2)
+        with bp_col1:
+            new_max_retries = st.number_input(
+                "Max Pause Retries",
+                min_value=0, max_value=100, value=current_max_retries,
+                help="จำนวนครั้งที่ Bot จะ retry ขณะถูก STOP ก่อน shutdown อัตโนมัติ (0 = ไม่จำกัด, retry ตลอด)",
+            )
+        with bp_col2:
+            new_retry_sec = st.number_input(
+                "Pause Retry Interval (วินาที)",
+                min_value=5, max_value=300, value=current_retry_sec,
+                help="เวลา (วินาที) ระหว่าง retry แต่ละครั้งขณะถูก STOP",
+            )
+
         submitted = st.form_submit_button("💾 Save Settings")
         if submitted:
             run_command(
                 """
                 UPDATE bot_settings
-                SET interval_seconds = %s, max_trades_per_day = %s, updated_at = NOW();
+                SET interval_seconds = %s, max_trades_per_day = %s,
+                    pause_max_retries = %s, pause_retry_sec = %s,
+                    updated_at = NOW();
                 """,
-                (new_interval, new_max_trades),
+                (new_interval, new_max_trades, new_max_retries, new_retry_sec),
             )
             run_command(
                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
-                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}"),
+                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
             )
             st.success("✅ บันทึกสำเร็จ!")
             st.rerun()

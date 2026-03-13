@@ -376,27 +376,30 @@ def log_event(event_type: str, message: str):
 def check_bot_status():
     """
     ถาม Database ว่า Dashboard สั่ง RUN หรือ STOP อยู่
-    Return: (is_running: bool, interval_seconds: int)
+    Return: (is_running, interval_seconds, pause_max_retries, pause_retry_sec)
     """
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT is_running, interval_seconds FROM bot_settings LIMIT 1;")
+        cur.execute(
+            "SELECT is_running, interval_seconds, "
+            "COALESCE(pause_max_retries, 5), COALESCE(pause_retry_sec, 10) "
+            "FROM bot_settings LIMIT 1;"
+        )
         row = cur.fetchone()
         cur.close()
         conn.close()
         if row:
-            return bool(row[0]), int(row[1])
-        return True, 300  # Default: รันทุก 5 นาที
+            return bool(row[0]), int(row[1]), int(row[2]), int(row[3])
+        return True, 300, 5, 10  # Defaults
     except Exception as e:
         print(f"[ERROR] เช็คสถานะ Bot ล้มเหลว: {e}")
-        return False, 60  # DB พัง -> หยุดเทรดไว้ก่อนเพื่อความปลอดภัย
+        return False, 60, 5, 10  # DB พัง -> หยุดเทรดไว้ก่อนเพื่อความปลอดภัย
 
 
 # ==========================================
 # MAIN LOOP – รันแบบ Background Service
 # ==========================================
-PAUSE_CHECK_SEC = 10          # เมื่อถูก Pause เช็คซ้ำทุก 10 วินาที
 MARKET_CLOSED_CHECK_SEC = 60  # เมื่อตลาดปิด เช็คซ้ำทุก 60 วินาที
 CONSECUTIVE_ERR_LIMIT = 5     # ผิดพลาดติดต่อกัน 5 ครั้ง -> หยุดอัตโนมัติ
 
@@ -406,7 +409,8 @@ def main_loop():
     log_event("START", "AI Trader service started")
 
     consecutive_errors = 0
-    _last_market_log = None   # ป้องกัน log spam ซ้ำทุกนาที
+    pause_retries = 0             # นับจำนวน retry ขณะ BREAKPOINT
+    _last_market_log = None       # ป้องกัน log spam ซ้ำทุกนาที
 
     while not _shutdown:
         # ---- 0. เช็คตลาดเปิด/ปิด (ประหยัดค่า API) ----
@@ -420,12 +424,29 @@ def main_loop():
         _last_market_log = None
 
         # ---- 1. เช็ค Kill Switch / Breakpoint จาก Dashboard ----
-        is_running, interval = check_bot_status()
+        is_running, interval, max_retries, retry_sec = check_bot_status()
 
         if not is_running:
-            print(f"⏸️  [BREAKPOINT] ระบบถูกสั่งหยุดจาก Dashboard – เช็คใหม่ใน {PAUSE_CHECK_SEC} วิ")
-            time.sleep(PAUSE_CHECK_SEC)
+            pause_retries += 1
+            # max_retries = 0 หมายถึง retry ไม่จำกัด
+            if max_retries > 0 and pause_retries >= max_retries:
+                msg = f"Auto-shutdown: BREAKPOINT retry limit reached ({pause_retries}/{max_retries})"
+                print(f"🔴 [SHUTDOWN] {msg}")
+                log_event("SHUTDOWN", msg)
+                break
+            print(
+                f"⏸️  [BREAKPOINT] ระบบถูกสั่งหยุดจาก Dashboard "
+                f"({pause_retries}/{max_retries if max_retries > 0 else '∞'}) "
+                f"– เช็คใหม่ใน {retry_sec} วิ"
+            )
+            time.sleep(retry_sec)
             continue
+
+        # Bot กลับมา RUN → รีเซ็ต pause counter
+        if pause_retries > 0:
+            print(f"✅ [RESUMED] Bot กลับมาทำงาน (หลัง pause {pause_retries} ครั้ง)")
+            log_event("RESUME", f"Bot resumed after {pause_retries} pause retries")
+            pause_retries = 0
 
         # ---- 2. ดึงราคา ----
         try:

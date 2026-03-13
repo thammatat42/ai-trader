@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at       TIMESTAMP
 );
 
+-- เพิ่ม column ใหม่ใน bot_settings (ถ้ายังไม่มี)
+ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS pause_max_retries INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS pause_retry_sec  INTEGER NOT NULL DEFAULT 10;
+
 -- Index
 CREATE INDEX IF NOT EXISTS idx_log_created    ON ai_analysis_log (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_created ON bot_events      (created_at DESC);
