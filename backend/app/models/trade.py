@@ -17,6 +17,9 @@ class Trade(Base):
     platform_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("trading_platforms.id"), index=True
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), index=True
+    )
     order_id: Mapped[str | None] = mapped_column(String(100))
     symbol: Mapped[str] = mapped_column(String(30), nullable=False)
     action: Mapped[str] = mapped_column(String(10), nullable=False)

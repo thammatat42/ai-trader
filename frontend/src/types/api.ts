@@ -69,20 +69,46 @@ export interface ApiKeyCreated extends ApiKey {
 // ---- Trading ----
 export interface Trade {
   id: string;
-  platform_id: string;
-  order_id: string;
+  platform_id: string | null;
+  user_id?: string | null;
+  order_id: string | null;
   symbol: string;
-  action: "buy" | "sell";
-  lot_size: number;
-  entry_price: number;
-  exit_price: number | null;
-  stop_loss: number | null;
-  take_profit: number | null;
+  action: string;
+  lot: number;
+  open_price: number | null;
+  close_price: number | null;
+  sl_price: number | null;
+  tp_price: number | null;
   profit: number | null;
-  status: "open" | "closed" | "cancelled" | "error";
+  commission: number | null;
+  swap: number | null;
+  status: string;
   ai_provider_id: string | null;
-  created_at: string;
+  ai_analysis_id: string | null;
+  opened_at: string;
   closed_at: string | null;
+}
+
+export interface TradeSummary {
+  total_trades: number;
+  open_trades: number;
+  closed_trades: number;
+  total_profit: number;
+  today_profit: number;
+  win_rate: number;
+  avg_profit: number;
+  avg_loss: number;
+  best_trade: number;
+  worst_trade: number;
+}
+
+export interface ManualTradeRequest {
+  platform_id: string;
+  symbol: string;
+  action: "BUY" | "SELL";
+  lot: number;
+  sl_price: number;
+  tp_price: number;
 }
 
 // ---- AI ----
@@ -111,9 +137,22 @@ export interface AiAnalysis {
 export interface TradingPlatform {
   id: string;
   name: string;
-  platform_type: "mt5_bridge" | "bitkub" | "binance";
+  platform_type: string;
+  endpoint_url: string | null;
+  config_json: Record<string, unknown>;
   is_active: boolean;
+  market_hours: string;
   created_at: string;
+  updated_at: string;
+}
+
+export interface PlatformAccount {
+  balance: number;
+  equity: number;
+  margin: number;
+  free_margin: number;
+  currency: string;
+  leverage: number;
 }
 
 // ---- Bot ----
@@ -121,11 +160,14 @@ export interface BotSettings {
   id: string;
   platform_id: string;
   is_running: boolean;
-  analysis_interval_seconds: number;
-  lot_size: number;
-  max_daily_trades: number;
-  stop_loss_pips: number;
-  take_profit_pips: number;
+  interval_seconds: number;
+  max_trades_per_day: number;
+  risk_percent: number;
+  sl_points: number;
+  tp_points: number;
+  pause_max_retries: number;
+  pause_retry_sec: number;
+  updated_at: string;
 }
 
 // ---- Plans & Subscriptions ----
