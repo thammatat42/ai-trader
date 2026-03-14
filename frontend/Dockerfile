@@ -15,7 +15,7 @@ WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-EXPOSE 3000
+EXPOSE 3100
 CMD ["npm", "run", "dev"]
 
 # ---- Build ----
@@ -41,5 +41,6 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
 USER nextjs
-EXPOSE 3000
+EXPOSE 3100
+ENV PORT=3100
 CMD ["node", "server.js"]

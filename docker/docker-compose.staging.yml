@@ -74,7 +74,7 @@ services:
     environment:
       - NODE_ENV=production
     ports:
-      - "3000:3000"
+      - "3100:3100"
 
   # ---- Celery Worker ----
   worker:

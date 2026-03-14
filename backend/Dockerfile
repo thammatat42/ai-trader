@@ -33,7 +33,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY --from=deps /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
 
-COPY requirements-dev.txt .
+COPY requirements.txt requirements-dev.txt ./
 RUN uv pip install --system --no-cache -r requirements-dev.txt
 COPY . .
 EXPOSE 8000

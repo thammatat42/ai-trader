@@ -83,7 +83,7 @@ services:
     volumes:
       - ../frontend/src:/app/src:rw   # Hot-reload
     ports:
-      - "3000:3000"
+      - "3100:3100"
     command: ["npm", "run", "dev"]
 
   # ---- Celery Worker (Background Tasks) ----
