@@ -127,3 +127,80 @@ export interface BotSettings {
   stop_loss_pips: number;
   take_profit_pips: number;
 }
+
+// ---- Plans & Subscriptions ----
+export interface Module {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  category: string;
+  icon: string | null;
+  sort_order: number;
+  is_active: boolean;
+}
+
+export interface PlanModule {
+  module: Module;
+  access_level: string;
+  quota_limit: number | null;
+}
+
+export interface Plan {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  price_monthly: number;
+  price_yearly: number;
+  currency: string;
+  ai_credits_monthly: number;
+  max_api_keys: number;
+  max_platforms: number;
+  max_trades_per_day: number;
+  features_json: Record<string, unknown> | null;
+  sort_order: number;
+  is_active: boolean;
+  is_default: boolean;
+}
+
+export interface PlanDetail extends Plan {
+  modules: PlanModule[];
+}
+
+export interface Subscription {
+  id: string;
+  user_id: string;
+  plan: Plan;
+  billing_cycle: string;
+  status: string;
+  started_at: string;
+  expires_at: string | null;
+  cancelled_at: string | null;
+  is_trial: boolean;
+  created_at: string;
+}
+
+export interface CreditBalance {
+  balance: number;
+  lifetime_earned: number;
+  lifetime_used: number;
+  updated_at: string | null;
+}
+
+export interface CreditTransaction {
+  id: string;
+  amount: number;
+  balance_after: number;
+  tx_type: string;
+  description: string | null;
+  reference_id: string | null;
+  created_at: string;
+}
+
+export interface UserPlanSummary {
+  plan_code: string | null;
+  plan_name: string | null;
+  credits_balance: number;
+  modules: string[];
+}

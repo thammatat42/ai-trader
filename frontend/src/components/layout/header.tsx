@@ -1,16 +1,20 @@
 "use client";
 
-import { Moon, Sun, Bell, LogOut } from "lucide-react";
+import { Moon, Sun, Bell, LogOut, Sparkles } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/stores/auth-store";
+import { usePlanStore } from "@/stores/plan-store";
 import { apiClient } from "@/lib/api-client";
 import { Badge } from "@/components/ui/badge";
+import Link from "next/link";
 
 export function Header() {
   const { theme, setTheme } = useTheme();
   const router = useRouter();
   const { user, logout: storeLogout } = useAuthStore();
+  const summary = usePlanStore((s) => s.summary);
+  const clearPlan = usePlanStore((s) => s.clear);
 
   async function handleLogout() {
     try {
@@ -19,6 +23,7 @@ export function Header() {
       // Logout even if the API call fails
     }
     storeLogout();
+    clearPlan();
     router.push("/login");
   }
 
@@ -27,6 +32,28 @@ export function Header() {
       <div />
 
       <div className="flex items-center gap-3">
+        {/* Credit balance */}
+        {summary && summary.plan_code !== "admin" && (
+          <Link
+            href="/dashboard/plans"
+            className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs hover:bg-accent transition-colors"
+          >
+            <Sparkles className="h-3.5 w-3.5 text-yellow-500" />
+            <span className="font-medium">{summary.credits_balance}</span>
+            <span className="text-muted-foreground">credits</span>
+          </Link>
+        )}
+
+        {/* Plan badge */}
+        {summary && (
+          <Badge
+            variant={summary.plan_code === "admin" ? "default" : "secondary"}
+            className="text-xs"
+          >
+            {summary.plan_name ?? "No Plan"}
+          </Badge>
+        )}
+
         <button
           onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
           className="rounded-md p-2 hover:bg-accent"

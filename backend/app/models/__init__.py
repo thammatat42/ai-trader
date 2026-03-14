@@ -11,6 +11,12 @@ from app.models.bot_event import BotEvent
 from app.models.audit_log import AuditLog
 from app.models.mcp_connection import McpConnection
 from app.models.login_activity import LoginActivity
+from app.models.module import Module
+from app.models.plan import Plan
+from app.models.plan_module import PlanModule
+from app.models.user_subscription import UserSubscription
+from app.models.credit_balance import CreditBalance
+from app.models.credit_transaction import CreditTransaction
 
 __all__ = [
     "User",
@@ -24,4 +30,10 @@ __all__ = [
     "AuditLog",
     "McpConnection",
     "LoginActivity",
+    "Module",
+    "Plan",
+    "PlanModule",
+    "UserSubscription",
+    "CreditBalance",
+    "CreditTransaction",
 ]

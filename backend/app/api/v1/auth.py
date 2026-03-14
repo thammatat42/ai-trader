@@ -26,7 +26,9 @@ from app.core.security import (
 )
 from app.models.api_key import ApiKey
 from app.models.login_activity import LoginActivity
+from app.models.plan import Plan
 from app.models.user import User
+from app.models.user_subscription import UserSubscription
 from app.schemas.auth import (
     ApiKeyCreatedResponse,
     ApiKeyCreateRequest,
@@ -75,6 +77,30 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db_sess
         role=role,
     )
     db.add(user)
+    await db.flush()
+
+    # Auto-subscribe to the default (free) plan and grant signup credits
+    default_plan_result = await db.execute(
+        select(Plan).where(Plan.is_default.is_(True), Plan.is_active.is_(True)).limit(1)
+    )
+    default_plan = default_plan_result.scalar_one_or_none()
+    if default_plan:
+        sub = UserSubscription(
+            user_id=user.id,
+            plan_id=default_plan.id,
+            billing_cycle="monthly",
+            status="active",
+        )
+        db.add(sub)
+
+        if default_plan.ai_credits_monthly > 0:
+            from app.core.access_control import grant_credits
+            await grant_credits(
+                db, user.id, default_plan.ai_credits_monthly,
+                tx_type="signup_bonus",
+                description=f"Welcome bonus: {default_plan.ai_credits_monthly} free AI credits",
+            )
+
     await db.commit()
     await db.refresh(user)
     return user

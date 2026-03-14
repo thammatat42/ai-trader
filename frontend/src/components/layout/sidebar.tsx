@@ -14,32 +14,39 @@ import {
   Settings,
   ChevronLeft,
   Users,
+  Crown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
 import { useAuthStore } from "@/stores/auth-store";
+import { usePlanStore } from "@/stores/plan-store";
 
 const navItems = [
-  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { href: "/dashboard/trades", label: "Trades", icon: ArrowLeftRight },
-  { href: "/dashboard/analytics", label: "Analytics", icon: BarChart3 },
-  { href: "/dashboard/ai-providers", label: "AI Providers", icon: Brain },
-  { href: "/dashboard/platforms", label: "Platforms", icon: Server },
-  { href: "/dashboard/bot-control", label: "Bot Control", icon: Bot },
-  { href: "/dashboard/api-keys", label: "API Keys", icon: Key },
-  { href: "/dashboard/logs", label: "Logs", icon: ScrollText },
-  { href: "/dashboard/users", label: "Users", icon: Users, adminOnly: true },
-  { href: "/dashboard/settings", label: "Settings", icon: Settings },
+  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, module: "dashboard" },
+  { href: "/dashboard/trades", label: "Trades", icon: ArrowLeftRight, module: "trades" },
+  { href: "/dashboard/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
+  { href: "/dashboard/ai-providers", label: "AI Providers", icon: Brain, module: "ai_providers" },
+  { href: "/dashboard/platforms", label: "Platforms", icon: Server, module: "platforms" },
+  { href: "/dashboard/bot-control", label: "Bot Control", icon: Bot, module: "bot_control" },
+  { href: "/dashboard/api-keys", label: "API Keys", icon: Key, module: "api_keys" },
+  { href: "/dashboard/logs", label: "Logs", icon: ScrollText, module: "logs" },
+  { href: "/dashboard/users", label: "Users", icon: Users, module: "user_management" },
+  { href: "/dashboard/settings", label: "Settings", icon: Settings, module: "settings" },
+  { href: "/dashboard/plans", label: "Plans & Billing", icon: Crown, module: null },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
   const user = useAuthStore((s) => s.user);
+  const summary = usePlanStore((s) => s.summary);
 
-  const visibleItems = navItems.filter(
-    (item) => !("adminOnly" in item && item.adminOnly) || user?.role === "admin"
-  );
+  const visibleItems = navItems.filter((item) => {
+    if (!item.module) return true;
+    if (user?.role === "admin") return true;
+    if (!summary) return item.module === "dashboard" || item.module === "settings";
+    return summary.modules.includes(item.module);
+  });
 
   return (
     <aside
