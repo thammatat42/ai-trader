@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 60
     RATE_LIMIT_AUTH_PER_MINUTE: int = 10  # stricter for login/register
 
+    # ---- Account Security ----
+    MAX_FAILED_LOGIN_ATTEMPTS: int = 5  # lock account after N failures
+    ACCOUNT_LOCKOUT_MINUTES: int = 30   # lock duration
+
     # ---- Database (PostgreSQL) ----
     DB_HOST: str = "db"
     DB_PORT: int = 5432

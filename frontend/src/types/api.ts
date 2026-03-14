@@ -21,6 +21,29 @@ export interface User {
   full_name: string | null;
   role: "admin" | "trader" | "viewer";
   is_active: boolean;
+  ban_reason: string | null;
+  banned_at: string | null;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+export interface UserDetail extends User {
+  banned_by: string | null;
+  failed_login_count: number;
+  locked_until: string | null;
+  updated_at: string;
+}
+
+export interface LoginActivity {
+  id: string;
+  user_id: string | null;
+  email: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  country: string | null;
+  city: string | null;
+  success: boolean;
+  failure_reason: string | null;
   created_at: string;
 }
 

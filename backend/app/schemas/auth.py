@@ -33,6 +33,9 @@ class UserResponse(BaseModel):
     full_name: str | None
     role: str
     is_active: bool
+    ban_reason: str | None = None
+    banned_at: datetime | None = None
+    last_login_at: datetime | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

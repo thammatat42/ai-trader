@@ -10,6 +10,7 @@ from app.models.bot_settings import BotSettings
 from app.models.bot_event import BotEvent
 from app.models.audit_log import AuditLog
 from app.models.mcp_connection import McpConnection
+from app.models.login_activity import LoginActivity
 
 __all__ = [
     "User",
@@ -22,4 +23,5 @@ __all__ = [
     "BotEvent",
     "AuditLog",
     "McpConnection",
+    "LoginActivity",
 ]

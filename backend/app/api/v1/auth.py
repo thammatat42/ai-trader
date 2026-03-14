@@ -2,8 +2,9 @@
 Auth API endpoints – register, login, refresh, logout, API key management.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import structlog
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from app.core.config import get_settings
 from app.core.database import get_db_session
 from app.core.dependencies import get_current_user
 from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.geo import resolve_ip_geo
 from app.core.redis import get_redis
 from app.core.security import (
     create_access_token,
@@ -23,6 +25,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.api_key import ApiKey
+from app.models.login_activity import LoginActivity
 from app.models.user import User
 from app.schemas.auth import (
     ApiKeyCreatedResponse,
@@ -35,6 +38,8 @@ from app.schemas.auth import (
     UserResponse,
 )
 from app.schemas.common import MessageResponse
+
+logger = structlog.get_logger("auth")
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -75,16 +80,111 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db_sess
     return user
 
 
+async def _record_login(
+    db: AsyncSession,
+    *,
+    user_id: str | None,
+    email: str,
+    ip_address: str,
+    user_agent: str | None,
+    success: bool,
+    failure_reason: str | None = None,
+) -> None:
+    """Record a login attempt with IP geolocation."""
+    country, city = await resolve_ip_geo(ip_address)
+    activity = LoginActivity(
+        user_id=user_id,
+        email=email,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        country=country,
+        city=city,
+        success=success,
+        failure_reason=failure_reason,
+    )
+    db.add(activity)
+    await db.commit()
+    logger.info(
+        "login_attempt",
+        email=email,
+        success=success,
+        ip=ip_address,
+        country=country,
+        reason=failure_reason,
+    )
+
+
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db_session)):
+async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends(get_db_session)):
+    settings = get_settings()
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent")
+
     result = await db.execute(select(User).where(User.email == body.email))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_password(body.password, user.hashed_password):
+    # User not found
+    if not user:
+        await _record_login(
+            db, user_id=None, email=body.email, ip_address=client_ip,
+            user_agent=user_agent, success=False, failure_reason="user_not_found",
+        )
         raise UnauthorizedError("Invalid email or password")
 
+    # Banned check
+    if user.is_banned:
+        await _record_login(
+            db, user_id=str(user.id), email=body.email, ip_address=client_ip,
+            user_agent=user_agent, success=False, failure_reason="banned",
+        )
+        raise UnauthorizedError("Account has been banned")
+
+    # Inactive check
     if not user.is_active:
+        await _record_login(
+            db, user_id=str(user.id), email=body.email, ip_address=client_ip,
+            user_agent=user_agent, success=False, failure_reason="inactive",
+        )
         raise UnauthorizedError("Account is disabled")
+
+    # Locked check
+    if user.is_locked:
+        await _record_login(
+            db, user_id=str(user.id), email=body.email, ip_address=client_ip,
+            user_agent=user_agent, success=False, failure_reason="locked",
+        )
+        raise UnauthorizedError("Account is temporarily locked. Try again later.")
+
+    # Password check
+    if not verify_password(body.password, user.hashed_password):
+        user.failed_login_count += 1
+        # Lock account after N failures
+        if user.failed_login_count >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
+            user.locked_until = datetime.now(timezone.utc) + timedelta(
+                minutes=settings.ACCOUNT_LOCKOUT_MINUTES
+            )
+            logger.warning(
+                "account_locked",
+                user_id=str(user.id),
+                failed_attempts=user.failed_login_count,
+            )
+        await db.commit()
+        await _record_login(
+            db, user_id=str(user.id), email=body.email, ip_address=client_ip,
+            user_agent=user_agent, success=False, failure_reason="invalid_password",
+        )
+        raise UnauthorizedError("Invalid email or password")
+
+    # Success – reset counters
+    user.failed_login_count = 0
+    user.locked_until = None
+    user.last_login_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    await _record_login(
+        db, user_id=str(user.id), email=body.email, ip_address=client_ip,
+        user_agent=user_agent, success=True,
+    )
 
     access_token = create_access_token({"sub": str(user.id)})
     refresh_token = create_refresh_token({"sub": str(user.id)})
