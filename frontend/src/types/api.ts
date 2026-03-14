@@ -116,21 +116,66 @@ export interface AiProvider {
   id: string;
   name: string;
   provider_type: "openrouter" | "nvidia_nim";
+  endpoint_url: string;
   model: string;
+  max_tokens: number;
+  temperature: number;
+  config_json: Record<string, unknown>;
   is_active: boolean;
+  last_health_at: string | null;
+  avg_latency_ms: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AiProviderCreateRequest {
+  name: string;
+  provider_type: string;
+  endpoint_url: string;
+  model: string;
+  api_key: string;
+  max_tokens?: number;
+  temperature?: number;
+  config_json?: Record<string, unknown>;
+}
+
+export interface AiProviderUpdateRequest {
+  name?: string;
+  endpoint_url?: string;
+  model?: string;
+  api_key?: string;
+  max_tokens?: number;
+  temperature?: number;
+  config_json?: Record<string, unknown>;
+}
+
+export interface AiProviderTestResponse {
+  is_healthy: boolean;
+  latency_ms: number;
+  message: string;
+}
+
+export interface AiAnalysisLog {
+  id: string;
+  ai_provider_id: string | null;
+  platform_id: string | null;
+  symbol: string;
+  bid: number | null;
+  ask: number | null;
+  ai_recommendation: string | null;
+  sentiment: string | null;
+  trade_action: string;
+  lot_size: number | null;
+  sl_price: number | null;
+  tp_price: number | null;
+  latency_ms: number | null;
+  correlation_id: string | null;
   created_at: string;
 }
 
-export interface AiAnalysis {
-  id: string;
-  ai_provider_id: string;
+export interface AiAnalysisRequest {
   platform_id: string;
-  sentiment: "bullish" | "bearish" | "neutral";
-  confidence: number;
-  reasoning: string;
-  recommendation: string;
-  latency_ms: number;
-  created_at: string;
+  symbol?: string;
 }
 
 // ---- Platform ----

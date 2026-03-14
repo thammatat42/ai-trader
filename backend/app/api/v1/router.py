@@ -5,6 +5,7 @@ API v1 – aggregate all sub-routers.
 from fastapi import APIRouter
 
 from app.api.v1.auth import api_keys_router, router as auth_router
+from app.api.v1.ai_providers import router as ai_providers_router
 from app.api.v1.health import router as health_router
 from app.api.v1.plans import admin_plans_router, credits_router, router as plans_router, subscriptions_router
 from app.api.v1.platforms import router as platforms_router
@@ -24,4 +25,5 @@ v1_router.include_router(credits_router)
 v1_router.include_router(admin_plans_router)
 v1_router.include_router(trades_router)
 v1_router.include_router(platforms_router)
+v1_router.include_router(ai_providers_router)
 v1_router.include_router(ws_router)
