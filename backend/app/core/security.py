@@ -6,24 +6,23 @@ API key generation, and field-level encryption.
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 from cryptography.fernet import Fernet
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.core.config import get_settings
 
 settings = get_settings()
 
 # ---- Password Hashing ----
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
 # ---- JWT Tokens ----
@@ -58,12 +57,12 @@ def generate_api_key() -> tuple[str, str]:
     """Generate a new API key. Returns (full_key, key_hash)."""
     raw = secrets.token_urlsafe(32)
     full_key = f"{API_KEY_PREFIX}{raw}"
-    key_hash = pwd_context.hash(full_key)
+    key_hash = bcrypt.hashpw(full_key.encode(), bcrypt.gensalt()).decode()
     return full_key, key_hash
 
 
 def verify_api_key(plain_key: str, key_hash: str) -> bool:
-    return pwd_context.verify(plain_key, key_hash)
+    return bcrypt.checkpw(plain_key.encode(), key_hash.encode())
 
 
 def get_api_key_prefix(key: str) -> str:

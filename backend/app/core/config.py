@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # ---- Rate Limiting ----
+    RATE_LIMIT_PER_MINUTE: int = 60
+    RATE_LIMIT_AUTH_PER_MINUTE: int = 10  # stricter for login/register
+
     # ---- Database (PostgreSQL) ----
     DB_HOST: str = "db"
     DB_PORT: int = 5432

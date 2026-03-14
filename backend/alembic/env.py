@@ -3,6 +3,12 @@ Alembic environment configuration.
 Uses the same SQLAlchemy models as the app for autogenerate support.
 """
 
+import sys
+from pathlib import Path
+
+# Ensure the backend root (/app) is on sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from logging.config import fileConfig
 
 from alembic import context

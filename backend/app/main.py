@@ -10,6 +10,7 @@ from app.api.v1.router import v1_router
 from app.core.config import get_settings
 from app.middleware.cors import add_cors_middleware
 from app.middleware.logging import LoggingMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
 
 
 def configure_logging(settings) -> None:
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
 
     # Middleware (order matters – last added = first executed)
     add_cors_middleware(app)
+    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(LoggingMiddleware)
 
     # Routes

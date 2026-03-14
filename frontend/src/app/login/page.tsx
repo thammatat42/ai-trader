@@ -5,9 +5,12 @@ import { useRouter } from "next/navigation";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { apiClient } from "@/lib/api-client";
+import { useAuthStore } from "@/stores/auth-store";
 
 export default function LoginPage() {
   const router = useRouter();
+  const setUser = useAuthStore((s) => s.setUser);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -19,24 +22,24 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-      const res = await fetch(`${apiUrl}/api/v1/auth/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
+      // Login — get tokens
+      const loginRes = await apiClient.post("/api/v1/auth/login", { email, password });
+      const { access_token, refresh_token } = loginRes.data;
+      localStorage.setItem("access_token", access_token);
+      localStorage.setItem("refresh_token", refresh_token);
 
-      if (!res.ok) {
-        const data = await res.json().catch(() => null);
-        throw new Error(data?.detail ?? "Login failed");
-      }
+      // Fetch user profile and set in store
+      const meRes = await apiClient.get("/api/v1/users/me");
+      setUser(meRes.data);
 
-      const data = await res.json();
-      localStorage.setItem("access_token", data.access_token);
-      localStorage.setItem("refresh_token", data.refresh_token);
       router.push("/dashboard");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+    } catch (err: unknown) {
+      if (err && typeof err === "object" && "response" in err) {
+        const axiosErr = err as { response?: { data?: { detail?: string } } };
+        setError(axiosErr.response?.data?.detail ?? "Login failed");
+      } else {
+        setError("Login failed");
+      }
     } finally {
       setLoading(false);
     }

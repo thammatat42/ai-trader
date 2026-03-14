@@ -60,6 +60,7 @@ services:
       - REDIS_HOST=redis
     volumes:
       - ../backend/app:/app/app:rw    # Hot-reload
+      - ../backend/alembic:/app/alembic:rw
     ports:
       - "8000:8000"
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -106,6 +107,7 @@ services:
       - REDIS_HOST=redis
     volumes:
       - ../backend/app:/app/app:rw
+      - ../backend/alembic:/app/alembic:rw
     command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=debug"]
 
 volumes:

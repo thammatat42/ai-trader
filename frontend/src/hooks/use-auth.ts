@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/stores/auth-store";
 import { apiClient } from "@/lib/api-client";
 
-export function useAuth() {
+export function useAuth({ redirect = true } = {}) {
   const router = useRouter();
   const { user, isAuthenticated, setUser, logout } = useAuthStore();
 
@@ -13,14 +13,16 @@ export function useAuth() {
     const token = localStorage.getItem("access_token");
     if (token && !user) {
       apiClient
-        .get("/api/v1/auth/me")
+        .get("/api/v1/users/me")
         .then((res) => setUser(res.data))
         .catch(() => {
           logout();
-          router.push("/login");
+          if (redirect) router.push("/login");
         });
+    } else if (!token && redirect) {
+      router.push("/login");
     }
-  }, [user, setUser, logout, router]);
+  }, [user, setUser, logout, router, redirect]);
 
   return { user, isAuthenticated, logout };
 }

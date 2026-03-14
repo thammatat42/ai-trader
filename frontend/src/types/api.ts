@@ -18,6 +18,7 @@ export interface HealthResponse {
 export interface User {
   id: string;
   email: string;
+  full_name: string | null;
   role: "admin" | "trader" | "viewer";
   is_active: boolean;
   created_at: string;
@@ -33,10 +34,13 @@ export interface ApiKey {
   id: string;
   name: string;
   key_prefix: string;
-  scopes: string[];
+  is_active: boolean;
   created_at: string;
-  expires_at: string | null;
   last_used_at: string | null;
+}
+
+export interface ApiKeyCreated extends ApiKey {
+  full_key: string;
 }
 
 // ---- Trading ----
