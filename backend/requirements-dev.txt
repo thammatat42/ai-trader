@@ -1,0 +1,14 @@
+# ==========================================
+# Dev / Test dependencies
+# ==========================================
+# Install: uv pip install --system -r requirements-dev.txt
+# All deps run inside Docker (Python 3.12).
+
+-r requirements.txt
+
+# --- Dev / Test ---
+pytest>=8.0.0,<9.0
+pytest-asyncio>=0.23.0,<1.0
+httpx>=0.27.0,<1.0
+ruff>=0.5.0,<1.0
+mypy>=1.10.0,<2.0

@@ -1,99 +1,57 @@
-# Python
-#
-# This file is a template of an ignore file for Python.
-#
-# For a comprehensive list of commonly ignored files, see:
-# https://github.com
-#
-# NOTE: This template is maintained in a separate JetBrains.gitignore that can
-# be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-# and can be added to the global gitignore or merged into this file.
+# ==========================================
+# AI Trader v2 – Root .gitignore
+# ==========================================
 
-# Byte-compiled / optimized files
+# ---- Python ----
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.manifest
-*.mo
-*.pot
-*.seed
-*.par
+*.egg
+dist/
+build/
+.venv/
+venv/
+env/
 
-# Unit test / coverage reports
+# ---- Node.js ----
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# ---- Environment / Secrets ----
+.env
+.env.*
+!.env.example
+!.env.local.example
+!docker/.env.dev
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Testing ----
 .coverage
 .coverage.*
-.hypothesis/
 .pytest_cache/
-nosetests.xml
-coverage.xml
-ea-report.xml
-.lgtm.yml
-.lgtm.yml.example
-
-# Sphinx documentation
-docs/_build/
-
-# PyInstaller
-# See https://pyinstaller.readthedocs.io
-*.toc
-*.bak
-*.idl
-*.pyi
-*.pyw
-*.spec
-*.pyc.make
-.pyinstaller/
-# for PyInstaller < 5.0
-build script.build/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-profile_default/
-ipython_config.py
-jupyter_notebook_config.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Packaging (pipenv, poetry, pdm, etc.)
-# lock files are generally recommended to be included in version control
-# Pipfile.lock
-# poetry.lock
-# pdm.lock
-.pipenv/
-
-# mypy
 .mypy_cache/
-.dmypy.json
-dmypy.json
-# Applications
-.idea/
-*.sublime-project
-*.sublime-workspace
+.ruff_cache/
+htmlcov/
+coverage.xml
+*.lcov
+
+# ---- Docker (local volumes) ----
+docker/data/
+
+# ---- OS ----
+desktop.ini
+ehthumbs.db

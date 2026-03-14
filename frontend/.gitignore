@@ -1,0 +1,10 @@
+# Frontend
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.env*.local
+*.log
+coverage/
+.eslintcache

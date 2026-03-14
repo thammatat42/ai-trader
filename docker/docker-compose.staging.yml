@@ -1,0 +1,112 @@
+# ==========================================
+# AI Trader v2 – Staging Environment
+# ==========================================
+# Usage: docker compose -f docker/docker-compose.staging.yml up --build -d
+# Features: production-like, sandbox API keys, partial debug
+# ==========================================
+
+services:
+
+  # ---- PostgreSQL ----
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME:-trading_log}
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+      - ../db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME:-trading_log}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---- Redis ----
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---- Backend (FastAPI) ----
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env.staging
+    environment:
+      - APP_ENV=staging
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+
+  # ---- Frontend (Next.js) ----
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      - backend
+    env_file:
+      - .env.staging
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+
+  # ---- Celery Worker ----
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env.staging
+    environment:
+      - APP_ENV=staging
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+
+  # ---- Nginx ----
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+    volumes:
+      - ./nginx/nginx.staging.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+
+volumes:
+  pgdata_staging:
