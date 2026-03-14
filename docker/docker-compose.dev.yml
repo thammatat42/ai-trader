@@ -83,6 +83,7 @@ services:
       - NEXT_PUBLIC_WS_URL=ws://localhost:8000
     volumes:
       - ../frontend/src:/app/src:rw   # Hot-reload
+      - nextcache_dev:/app/.next      # Persist Turbopack cache across restarts
     ports:
       - "3100:3100"
     command: ["npm", "run", "dev"]
@@ -112,3 +113,4 @@ services:
 
 volumes:
   pgdata_dev:
+  nextcache_dev:
