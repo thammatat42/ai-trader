@@ -414,7 +414,7 @@ export default function AdminPlansManagePage() {
       )}
 
       {/* ── Create Plan Dialog ── */}
-      <Dialog open={createOpen} onClose={() => setCreateOpen(false)}>
+      <Dialog open={createOpen} onOpenChange={(v) => { if (!v) setCreateOpen(false); }}>
         <DialogHeader>
           <DialogTitle>Create New Plan</DialogTitle>
           <DialogDescription>
@@ -639,7 +639,7 @@ export default function AdminPlansManagePage() {
       </Dialog>
 
       {/* ── Edit Plan Dialog ── */}
-      <Dialog open={!!editPlan} onClose={() => setEditPlan(null)}>
+      <Dialog open={!!editPlan} onOpenChange={(v) => { if (!v) setEditPlan(null); }}>
         <DialogHeader>
           <DialogTitle>
             Edit Plan: {editPlan?.name}{" "}
@@ -855,7 +855,7 @@ export default function AdminPlansManagePage() {
       {/* ── Add Module Dialog ── */}
       <Dialog
         open={!!addModulePlanId}
-        onClose={() => setAddModulePlanId(null)}
+        onOpenChange={(v) => { if (!v) setAddModulePlanId(null); }}
       >
         <DialogHeader>
           <DialogTitle>Add Module to Plan</DialogTitle>
