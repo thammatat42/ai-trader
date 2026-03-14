@@ -13,9 +13,11 @@ import {
   ScrollText,
   Settings,
   ChevronLeft,
+  Users,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
+import { useAuthStore } from "@/stores/auth-store";
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -26,12 +28,18 @@ const navItems = [
   { href: "/dashboard/bot-control", label: "Bot Control", icon: Bot },
   { href: "/dashboard/api-keys", label: "API Keys", icon: Key },
   { href: "/dashboard/logs", label: "Logs", icon: ScrollText },
+  { href: "/dashboard/users", label: "Users", icon: Users, adminOnly: true },
   { href: "/dashboard/settings", label: "Settings", icon: Settings },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
+  const user = useAuthStore((s) => s.user);
+
+  const visibleItems = navItems.filter(
+    (item) => !("adminOnly" in item && item.adminOnly) || user?.role === "admin"
+  );
 
   return (
     <aside
@@ -61,7 +69,7 @@ export function Sidebar() {
       </div>
 
       <nav className="flex-1 space-y-1 p-2">
-        {navItems.map((item) => {
+        {visibleItems.map((item) => {
           const isActive =
             pathname === item.href ||
             (item.href !== "/dashboard" && pathname.startsWith(item.href));
