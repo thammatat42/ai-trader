@@ -1,7 +1,9 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ModuleGate } from "@/components/module-gate";
 
 export default function BotControlPage() {
   return (
+    <ModuleGate module="bot_control">
     <div className="space-y-6">
       <h1 className="text-3xl font-bold">Bot Control</h1>
       <Card>
@@ -15,5 +17,6 @@ export default function BotControlPage() {
         </CardContent>
       </Card>
     </div>
+    </ModuleGate>
   );
 }

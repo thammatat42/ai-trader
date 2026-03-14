@@ -42,6 +42,7 @@ import {
 } from "@/components/ui/dialog";
 import { apiClient } from "@/lib/api-client";
 import { useAuth } from "@/hooks/use-auth";
+import { ModuleGate } from "@/components/module-gate";
 import type { UserDetail, LoginActivity } from "@/types/api";
 
 // ---- Constants ----
@@ -290,6 +291,7 @@ export default function UserManagementPage() {
   // ---- Render ----
 
   return (
+    <ModuleGate module="user_management">
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold">User Management</h1>
@@ -850,5 +852,6 @@ export default function UserManagementPage() {
         </form>
       </Dialog>
     </div>
+    </ModuleGate>
   );
 }

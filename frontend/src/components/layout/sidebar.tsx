@@ -15,6 +15,7 @@ import {
   ChevronLeft,
   Users,
   Crown,
+  Settings2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
@@ -33,6 +34,7 @@ const navItems = [
   { href: "/dashboard/users", label: "Users", icon: Users, module: "user_management" },
   { href: "/dashboard/settings", label: "Settings", icon: Settings, module: "settings" },
   { href: "/dashboard/plans", label: "Plans & Billing", icon: Crown, module: null },
+  { href: "/dashboard/plans/manage", label: "Plan Management", icon: Settings2, module: null, adminOnly: true },
 ];
 
 export function Sidebar() {
@@ -42,6 +44,7 @@ export function Sidebar() {
   const summary = usePlanStore((s) => s.summary);
 
   const visibleItems = navItems.filter((item) => {
+    if ("adminOnly" in item && item.adminOnly) return user?.role === "admin";
     if (!item.module) return true;
     if (user?.role === "admin") return true;
     if (!summary) return item.module === "dashboard" || item.module === "settings";

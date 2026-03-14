@@ -27,6 +27,10 @@ from app.schemas.plan import (
     PlanModuleResponse,
     PlanResponse,
     ModuleResponse,
+    PlanCreateRequest,
+    PlanUpdateRequest,
+    PlanModuleAssignRequest,
+    ModuleUpdateRequest,
     SubscribeRequest,
     SubscriptionResponse,
     UserPlanSummary,
@@ -408,3 +412,203 @@ async def admin_assign_plan(
     await db.commit()
     logger.info("admin_assign_plan", admin=str(admin.id), user=str(target.id), plan=plan.code)
     return MessageResponse(message=f"Assigned {plan.name} plan to user")
+
+
+# ── Admin: Plan CRUD ──────────────────────────────────────────────────
+
+admin_plans_router = APIRouter(prefix="/admin/plans", tags=["admin-plans"])
+
+
+@admin_plans_router.get("", response_model=list[PlanResponse])
+async def admin_list_all_plans(
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin lists ALL plans (including inactive)."""
+    result = await db.execute(select(Plan).order_by(Plan.sort_order))
+    return result.scalars().all()
+
+
+@admin_plans_router.post("", response_model=PlanResponse, status_code=201)
+async def admin_create_plan(
+    body: PlanCreateRequest,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin creates a new plan."""
+    existing = await db.execute(select(Plan).where(Plan.code == body.code))
+    if existing.scalar_one_or_none():
+        raise ConflictError("Plan with this code already exists")
+
+    plan = Plan(**body.model_dump())
+    db.add(plan)
+    await db.commit()
+    await db.refresh(plan)
+    logger.info("plan_created", plan=plan.code, admin=str(admin.id))
+    return plan
+
+
+@admin_plans_router.put("/{plan_id}", response_model=PlanResponse)
+async def admin_update_plan(
+    plan_id: str,
+    body: PlanUpdateRequest,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin updates a plan's details."""
+    result = await db.execute(select(Plan).where(Plan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise NotFoundError("Plan")
+
+    update_data = body.model_dump(exclude_none=True)
+    for key, value in update_data.items():
+        setattr(plan, key, value)
+
+    await db.commit()
+    await db.refresh(plan)
+    logger.info("plan_updated", plan=plan.code, admin=str(admin.id))
+    return plan
+
+
+@admin_plans_router.delete("/{plan_id}", response_model=MessageResponse)
+async def admin_delete_plan(
+    plan_id: str,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin soft-deletes (deactivates) a plan."""
+    result = await db.execute(select(Plan).where(Plan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise NotFoundError("Plan")
+
+    plan.is_active = False
+    await db.commit()
+    logger.info("plan_deactivated", plan=plan.code, admin=str(admin.id))
+    return MessageResponse(message=f"Plan '{plan.name}' deactivated")
+
+
+# ── Admin: Plan ↔ Module management ──────────────────────────────────
+
+@admin_plans_router.get("/{plan_id}/modules", response_model=list[PlanModuleResponse])
+async def admin_get_plan_modules(
+    plan_id: str,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin gets all modules for a plan."""
+    result = await db.execute(select(Plan).where(Plan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise NotFoundError("Plan")
+
+    pm_result = await db.execute(
+        select(PlanModule, Module)
+        .join(Module, Module.id == PlanModule.module_id)
+        .where(PlanModule.plan_id == plan.id)
+        .order_by(Module.sort_order)
+    )
+    rows = pm_result.all()
+    modules = []
+    for pm, mod in rows:
+        modules.append(PlanModuleResponse(
+            module=ModuleResponse.model_validate(mod),
+            access_level=pm.access_level,
+            quota_limit=pm.quota_limit,
+        ))
+    return modules
+
+
+@admin_plans_router.post("/{plan_id}/modules", response_model=MessageResponse)
+async def admin_add_plan_module(
+    plan_id: str,
+    body: PlanModuleAssignRequest,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin adds a module to a plan."""
+    result = await db.execute(select(Plan).where(Plan.id == plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise NotFoundError("Plan")
+
+    mod_result = await db.execute(select(Module).where(Module.code == body.module_code))
+    mod = mod_result.scalar_one_or_none()
+    if not mod:
+        raise NotFoundError("Module")
+
+    # Check if already assigned
+    existing = await db.execute(
+        select(PlanModule).where(
+            PlanModule.plan_id == plan.id,
+            PlanModule.module_id == mod.id,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise ConflictError("Module already assigned to this plan")
+
+    pm = PlanModule(
+        plan_id=plan.id,
+        module_id=mod.id,
+        access_level=body.access_level,
+        quota_limit=body.quota_limit,
+    )
+    db.add(pm)
+    await db.commit()
+    logger.info("plan_module_added", plan=plan.code, module=mod.code, admin=str(admin.id))
+    return MessageResponse(message=f"Module '{mod.name}' added to plan '{plan.name}'")
+
+
+@admin_plans_router.delete("/{plan_id}/modules/{module_code}", response_model=MessageResponse)
+async def admin_remove_plan_module(
+    plan_id: str,
+    module_code: str,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin removes a module from a plan."""
+    mod_result = await db.execute(select(Module).where(Module.code == module_code))
+    mod = mod_result.scalar_one_or_none()
+    if not mod:
+        raise NotFoundError("Module")
+
+    pm_result = await db.execute(
+        select(PlanModule).where(
+            PlanModule.plan_id == plan_id,
+            PlanModule.module_id == mod.id,
+        )
+    )
+    pm = pm_result.scalar_one_or_none()
+    if not pm:
+        raise NotFoundError("Plan-Module assignment")
+
+    await db.delete(pm)
+    await db.commit()
+    logger.info("plan_module_removed", plan_id=plan_id, module=module_code, admin=str(admin.id))
+    return MessageResponse(message=f"Module '{mod.name}' removed from plan")
+
+
+# ── Admin: Module management ─────────────────────────────────────────
+
+@admin_plans_router.put("/modules/{module_id}", response_model=ModuleResponse)
+async def admin_update_module(
+    module_id: str,
+    body: ModuleUpdateRequest,
+    admin: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin updates a module's details."""
+    result = await db.execute(select(Module).where(Module.id == module_id))
+    mod = result.scalar_one_or_none()
+    if not mod:
+        raise NotFoundError("Module")
+
+    update_data = body.model_dump(exclude_none=True)
+    for key, value in update_data.items():
+        setattr(mod, key, value)
+
+    await db.commit()
+    await db.refresh(mod)
+    logger.info("module_updated", module=mod.code, admin=str(admin.id))
+    return mod

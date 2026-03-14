@@ -7,8 +7,10 @@ import {
   Check,
   Sparkles,
   ArrowRight,
+  ArrowUp,
   Clock,
   Loader2,
+  Settings2,
 } from "lucide-react";
 import {
   Card,
@@ -22,6 +24,7 @@ import { Badge } from "@/components/ui/badge";
 import { apiClient } from "@/lib/api-client";
 import { usePlanStore } from "@/stores/plan-store";
 import { useAuthStore } from "@/stores/auth-store";
+import Link from "next/link";
 import type {
   Plan,
   PlanDetail,
@@ -95,7 +98,6 @@ export default function PlansPage() {
       queryClient.invalidateQueries({ queryKey: ["subscription"] });
       queryClient.invalidateQueries({ queryKey: ["credits"] });
       queryClient.invalidateQueries({ queryKey: ["credit-transactions"] });
-      // Refresh the plan summary in the store
       try {
         const res = await apiClient.get("/api/v1/subscriptions/me/summary");
         setSummary(res.data as UserPlanSummary);
@@ -110,6 +112,7 @@ export default function PlansPage() {
       apiClient.post("/api/v1/subscriptions/cancel").then((r) => r.data),
     onSuccess: async () => {
       queryClient.invalidateQueries({ queryKey: ["subscription"] });
+      queryClient.invalidateQueries({ queryKey: ["credits"] });
       try {
         const res = await apiClient.get("/api/v1/subscriptions/me/summary");
         setSummary(res.data as UserPlanSummary);
@@ -120,7 +123,13 @@ export default function PlansPage() {
   });
 
   const isAdmin = user?.role === "admin";
-  const currentPlanCode = summary?.plan_code;
+  const currentPlanCode = isAdmin ? "admin" : summary?.plan_code;
+
+  // For admin, treat "admin" as above all plans
+  function getPlanIndex(code: string | null | undefined) {
+    if (!code || code === "admin") return -1;
+    return plans.findIndex((p) => p.code === code);
+  }
 
   if (plansLoading) {
     return (
@@ -132,11 +141,21 @@ export default function PlansPage() {
 
   return (
     <div className="space-y-8">
-      <div>
-        <h1 className="text-3xl font-bold">Plans & Billing</h1>
-        <p className="mt-1 text-muted-foreground">
-          Manage your subscription and AI credits
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold">Plans & Billing</h1>
+          <p className="mt-1 text-muted-foreground">
+            Manage your subscription and AI credits
+          </p>
+        </div>
+        {isAdmin && (
+          <Link href="/dashboard/plans/manage">
+            <Button variant="outline">
+              <Settings2 className="mr-2 h-4 w-4" />
+              Manage Plans
+            </Button>
+          </Link>
+        )}
       </div>
 
       {/* Current Plan Summary */}
@@ -265,12 +284,13 @@ export default function PlansPage() {
                     variant={isCurrent ? "outline" : "default"}
                     disabled={
                       isCurrent ||
-                      isAdmin ||
                       subscribeMutation.isPending
                     }
                     onClick={() => {
                       setSelectedPlan(plan.code);
-                      subscribeMutation.mutate(plan.code);
+                      if (!isCurrent) {
+                        subscribeMutation.mutate(plan.code);
+                      }
                     }}
                   >
                     {subscribeMutation.isPending &&
@@ -280,16 +300,34 @@ export default function PlansPage() {
                       "Current Plan"
                     ) : (
                       <>
-                        {currentPlanCode &&
-                        plans.findIndex((p) => p.code === plan.code) >
-                          plans.findIndex(
-                            (p) => p.code === currentPlanCode
-                          )
-                          ? "Upgrade"
-                          : "Switch"}
-                        <ArrowRight className="ml-2 h-4 w-4" />
+                        {getPlanIndex(plan.code) >
+                        getPlanIndex(currentPlanCode) ? (
+                          <>
+                            Upgrade
+                            <ArrowUp className="ml-2 h-4 w-4" />
+                          </>
+                        ) : (
+                          <>
+                            Switch
+                            <ArrowRight className="ml-2 h-4 w-4" />
+                          </>
+                        )}
                       </>
                     )}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full text-xs"
+                    onClick={() =>
+                      setSelectedPlan(
+                        selectedPlan === plan.code ? null : plan.code
+                      )
+                    }
+                  >
+                    {selectedPlan === plan.code
+                      ? "Hide modules"
+                      : "View included modules"}
                   </Button>
                 </CardContent>
               </Card>

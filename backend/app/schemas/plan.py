@@ -90,6 +90,56 @@ class AdminAdjustCreditsRequest(BaseModel):
     reason: str
 
 
+# ── Admin Plan CRUD ───────────────────────────────────────────────────
+
+class PlanCreateRequest(BaseModel):
+    code: str
+    name: str
+    description: str | None = None
+    price_monthly: float = 0
+    price_yearly: float = 0
+    currency: str = "USD"
+    ai_credits_monthly: int = 0
+    max_api_keys: int = 1
+    max_platforms: int = 1
+    max_trades_per_day: int = 5
+    features_json: dict | None = None
+    sort_order: int = 0
+    is_active: bool = True
+    is_default: bool = False
+
+
+class PlanUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    price_monthly: float | None = None
+    price_yearly: float | None = None
+    currency: str | None = None
+    ai_credits_monthly: int | None = None
+    max_api_keys: int | None = None
+    max_platforms: int | None = None
+    max_trades_per_day: int | None = None
+    features_json: dict | None = None
+    sort_order: int | None = None
+    is_active: bool | None = None
+    is_default: bool | None = None
+
+
+class PlanModuleAssignRequest(BaseModel):
+    module_code: str
+    access_level: str = "full"
+    quota_limit: int | None = None
+
+
+class ModuleUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    category: str | None = None
+    icon: str | None = None
+    sort_order: int | None = None
+    is_active: bool | None = None
+
+
 class UserPlanSummary(BaseModel):
     """Minimal plan info returned with user profile / auth."""
     plan_code: str | None

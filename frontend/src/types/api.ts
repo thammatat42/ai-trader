@@ -204,3 +204,43 @@ export interface UserPlanSummary {
   credits_balance: number;
   modules: string[];
 }
+
+// ---- Admin Plan CRUD ----
+export interface PlanCreateRequest {
+  code: string;
+  name: string;
+  description?: string | null;
+  price_monthly?: number;
+  price_yearly?: number;
+  currency?: string;
+  ai_credits_monthly?: number;
+  max_api_keys?: number;
+  max_platforms?: number;
+  max_trades_per_day?: number;
+  features_json?: Record<string, unknown> | null;
+  sort_order?: number;
+  is_active?: boolean;
+  is_default?: boolean;
+}
+
+export interface PlanUpdateRequest {
+  name?: string;
+  description?: string | null;
+  price_monthly?: number;
+  price_yearly?: number;
+  currency?: string;
+  ai_credits_monthly?: number;
+  max_api_keys?: number;
+  max_platforms?: number;
+  max_trades_per_day?: number;
+  features_json?: Record<string, unknown> | null;
+  sort_order?: number;
+  is_active?: boolean;
+  is_default?: boolean;
+}
+
+export interface PlanModuleAssignRequest {
+  module_code: string;
+  access_level?: string;
+  quota_limit?: number | null;
+}

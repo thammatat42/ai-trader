@@ -1,7 +1,9 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ModuleGate } from "@/components/module-gate";
 
 export default function TradesPage() {
   return (
+    <ModuleGate module="trades">
     <div className="space-y-6">
       <h1 className="text-3xl font-bold">Trades</h1>
       <Card>
@@ -15,5 +17,6 @@ export default function TradesPage() {
         </CardContent>
       </Card>
     </div>
+    </ModuleGate>
   );
 }

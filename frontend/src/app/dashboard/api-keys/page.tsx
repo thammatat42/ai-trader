@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { apiClient } from "@/lib/api-client";
+import { ModuleGate } from "@/components/module-gate";
 import type { ApiKey, ApiKeyCreated } from "@/types/api";
 
 export default function ApiKeysPage() {
@@ -54,6 +55,7 @@ export default function ApiKeysPage() {
   }
 
   return (
+    <ModuleGate module="api_keys">
     <div className="space-y-6">
       <h1 className="text-3xl font-bold">API Keys</h1>
 
@@ -157,5 +159,6 @@ export default function ApiKeysPage() {
         </CardContent>
       </Card>
     </div>
+    </ModuleGate>
   );
 }
