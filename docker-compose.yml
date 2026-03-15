@@ -3,8 +3,9 @@
 # ==========================================
 # Services:
 #   1. db         – PostgreSQL 16
-#   2. trader     – AI Trading Bot (xauusd_analyzer.py loop)
-#   3. dashboard  – Streamlit Admin Dashboard
+#   2. redis      – Redis 7 (market journal & cache)
+#   3. trader     – AI Trading Bot (xauusd_analyzer.py loop)
+#   4. dashboard  – Streamlit Admin Dashboard
 # ==========================================
 
 services:
@@ -28,6 +29,20 @@ services:
       timeout: 3s
       retries: 5
 
+  # ---- Redis (Market Journal & Cache) ----
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # ---- AI Trader Bot ----
   trader:
     build: .
@@ -35,10 +50,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - .env
     environment:
-      - DB_HOST=db         # override เพื่อให้ชี้ไปที่ container ชื่อ db
+      - DB_HOST=db
+      - REDIS_HOST=redis
     command: ["python", "-u", "xauusd_analyzer.py"]
 
   # ---- Admin Dashboard (Streamlit) ----
@@ -58,3 +76,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:

@@ -70,3 +70,21 @@ CREATE INDEX IF NOT EXISTS idx_events_created ON bot_events      (created_at DES
 CREATE INDEX IF NOT EXISTS idx_trades_status  ON trades          (status);
 CREATE INDEX IF NOT EXISTS idx_trades_opened  ON trades          (opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_order   ON trades          (order_id);
+
+-- ==========================================
+-- ตาราง api_usage_log – บันทึกการใช้งาน AI API (OpenRouter / NVIDIA)
+-- ==========================================
+CREATE TABLE IF NOT EXISTS api_usage_log (
+    id                  SERIAL PRIMARY KEY,
+    provider            VARCHAR(20)   NOT NULL,        -- openrouter / nvidia
+    model               VARCHAR(100)  NOT NULL,
+    prompt_tokens       INTEGER       DEFAULT 0,
+    completion_tokens   INTEGER       DEFAULT 0,
+    total_tokens        INTEGER       DEFAULT 0,
+    response_time_ms    INTEGER       DEFAULT 0,        -- latency in ms
+    status              VARCHAR(10)   DEFAULT 'OK',     -- OK / ERROR
+    created_at          TIMESTAMP     DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_usage_created  ON api_usage_log (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_usage_provider ON api_usage_log (provider);

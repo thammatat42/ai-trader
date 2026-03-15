@@ -66,6 +66,118 @@ def get_price(symbol: str):
     }
 
 
+# ==========================================
+# CANDLE DATA (OHLC)
+# ==========================================
+TIMEFRAME_MAP = {
+    "M1":  mt5.TIMEFRAME_M1,
+    "M5":  mt5.TIMEFRAME_M5,
+    "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30,
+    "H1":  mt5.TIMEFRAME_H1,
+    "H4":  mt5.TIMEFRAME_H4,
+    "D1":  mt5.TIMEFRAME_D1,
+}
+
+
+@app.get("/candles/{symbol}")
+def get_candles(
+    symbol: str,
+    timeframe: str = Query(default="H1", regex="^(M1|M5|M15|M30|H1|H4|D1)$"),
+    count: int = Query(default=50, ge=1, le=500),
+):
+    """
+    ดึง OHLCV candle data จาก MT5
+    - timeframe: M1, M5, M15, M30, H1, H4, D1
+    - count: จำนวนแท่งเทียน (1-500)
+    """
+    if not ensure_mt5_connected():
+        return {"error": "MT5 is not connected"}
+
+    tf = TIMEFRAME_MAP.get(timeframe)
+    if tf is None:
+        return {"error": f"Invalid timeframe: {timeframe}"}
+
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return {"error": f"No candle data for {symbol} {timeframe}"}
+
+    candles = []
+    for r in rates:
+        candles.append({
+            "time": int(r["time"]),
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low": float(r["low"]),
+            "close": float(r["close"]),
+            "volume": int(r["tick_volume"]),
+        })
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "count": len(candles),
+        "candles": candles,
+    }
+
+
+# ==========================================
+# ORDER BOOK / DEPTH OF MARKET
+# ==========================================
+@app.get("/orderbook/{symbol}")
+def get_orderbook(symbol: str, depth: int = Query(default=10, ge=1, le=50)):
+    """
+    ดึง Depth of Market (DOM) จาก MT5
+    ต้องเปิด Market Depth ใน MT5 ก่อนใช้งาน
+    """
+    if not ensure_mt5_connected():
+        return {"error": "MT5 is not connected"}
+
+    # เปิด Market Depth สำหรับ symbol นี้
+    if not mt5.market_book_add(symbol):
+        # บาง broker ไม่รองรับ DOM → ส่ง spread-based fallback
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return {"error": f"Symbol {symbol} not found"}
+        return {
+            "symbol": symbol,
+            "dom_available": False,
+            "spread": round(tick.ask - tick.bid, 2),
+            "bid": tick.bid,
+            "ask": tick.ask,
+            "bids": [],
+            "asks": [],
+        }
+
+    book = mt5.market_book_get(symbol)
+    mt5.market_book_release(symbol)
+
+    if book is None or len(book) == 0:
+        return {"symbol": symbol, "dom_available": False, "bids": [], "asks": []}
+
+    bids = []
+    asks = []
+    for item in book:
+        entry = {"price": item.price, "volume": item.volume}
+        if item.type == mt5.BOOK_TYPE_SELL:
+            asks.append(entry)
+        elif item.type == mt5.BOOK_TYPE_BUY:
+            bids.append(entry)
+
+    # เรียงลำดับ: bids สูง→ต่ำ, asks ต่ำ→สูง
+    bids.sort(key=lambda x: x["price"], reverse=True)
+    asks.sort(key=lambda x: x["price"])
+
+    return {
+        "symbol": symbol,
+        "dom_available": True,
+        "bids": bids[:depth],
+        "asks": asks[:depth],
+        "bid_total_vol": sum(b["volume"] for b in bids[:depth]),
+        "ask_total_vol": sum(a["volume"] for a in asks[:depth]),
+    }
+
+
 @app.post("/trade")
 def execute_trade(req: TradeRequest):
     """

@@ -203,7 +203,7 @@ def sync_mt5_to_db():
 st.sidebar.title("🧭 Navigation")
 page = st.sidebar.radio(
     "เลือกหน้า",
-    ["🏠 Overview", "📊 Trade Reports", "📈 Analysis Log", "🎛️ Bot Control", "📋 Event Log"],
+    ["🏠 Overview", "📊 Trade Reports", "📈 Analysis Log", "🎛️ Bot Control", "📋 Event Log", "🔑 API Usage"],
 )
 
 # Auto-refresh toggle
@@ -871,6 +871,293 @@ elif page == "📋 Event Log":
         )
     else:
         st.info("ยังไม่มี Event")
+
+
+# ==========================================
+# PAGE: API USAGE
+# ==========================================
+elif page == "🔑 API Usage":
+    st.title("🔑 AI API Usage Monitor")
+
+    # --- Period Selector ---
+    api_period = st.radio(
+        "ช่วงเวลา",
+        ["Today", "Last 7 Days", "Last 30 Days", "All Time"],
+        horizontal=True,
+        key="api_period",
+    )
+    api_period_map = {
+        "Today": "date_trunc('day', NOW())",
+        "Last 7 Days": "NOW() - INTERVAL '7 days'",
+        "Last 30 Days": "NOW() - INTERVAL '30 days'",
+        "All Time": "'2000-01-01'::timestamp",
+    }
+    api_date_filter = f"created_at >= {api_period_map[api_period]}"
+
+    # --- Overall Summary ---
+    st.subheader("📊 Overall Summary")
+    api_summary = run_query(
+        f"""
+        SELECT
+            COUNT(*) AS total_calls,
+            COUNT(*) FILTER (WHERE status = 'OK') AS success,
+            COUNT(*) FILTER (WHERE status = 'ERROR') AS errors,
+            COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens,
+            COALESCE(SUM(total_tokens), 0) AS total_tokens,
+            ROUND(AVG(response_time_ms)::numeric, 0) AS avg_latency_ms,
+            ROUND(AVG(total_tokens)::numeric, 0) AS avg_tokens_per_call,
+            MAX(response_time_ms) AS max_latency_ms,
+            MIN(created_at) AS first_call,
+            MAX(created_at) AS last_call
+        FROM api_usage_log
+        WHERE {api_date_filter};
+        """
+    )
+
+    if api_summary and api_summary[0] and api_summary[0]["total_calls"] > 0:
+        s = api_summary[0]
+        error_rate = (int(s["errors"]) / int(s["total_calls"]) * 100) if int(s["total_calls"]) > 0 else 0
+
+        ac1, ac2, ac3, ac4 = st.columns(4)
+        ac1.metric("Total API Calls", f"{s['total_calls']:,}")
+        ac2.metric("✅ Success", f"{s['success']:,}")
+        ac3.metric("❌ Errors", f"{s['errors']:,}")
+        ac4.metric("Error Rate", f"{error_rate:.1f}%")
+
+        tc1, tc2, tc3, tc4 = st.columns(4)
+        tc1.metric("Total Tokens", f"{int(s['total_tokens']):,}")
+        tc2.metric("Prompt Tokens", f"{int(s['total_prompt_tokens']):,}")
+        tc3.metric("Completion Tokens", f"{int(s['total_completion_tokens']):,}")
+        tc4.metric("Avg Tokens/Call", f"{int(s['avg_tokens_per_call']):,}")
+
+        lc1, lc2, lc3 = st.columns(3)
+        lc1.metric("Avg Latency", f"{int(s['avg_latency_ms']):,} ms")
+        lc2.metric("Max Latency", f"{int(s['max_latency_ms']):,} ms")
+        lc3.metric("Last Call", s["last_call"].strftime("%Y-%m-%d %H:%M") if s["last_call"] else "N/A")
+    else:
+        st.info("ยังไม่มีข้อมูล API Usage ในช่วงเวลานี้")
+
+    st.divider()
+
+    # --- Per-Provider Breakdown ---
+    st.subheader("🏢 Usage by Provider")
+    provider_stats = run_query(
+        f"""
+        SELECT
+            provider,
+            COUNT(*) AS calls,
+            COUNT(*) FILTER (WHERE status = 'OK') AS success,
+            COUNT(*) FILTER (WHERE status = 'ERROR') AS errors,
+            COALESCE(SUM(total_tokens), 0) AS tokens,
+            ROUND(AVG(response_time_ms)::numeric, 0) AS avg_latency,
+            ROUND(AVG(total_tokens)::numeric, 0) AS avg_tokens
+        FROM api_usage_log
+        WHERE {api_date_filter}
+        GROUP BY provider
+        ORDER BY calls DESC;
+        """
+    )
+    if provider_stats:
+        df_prov = pd.DataFrame(provider_stats)
+        st.dataframe(
+            df_prov,
+            use_container_width=True,
+            column_config={
+                "provider": "Provider",
+                "calls": "API Calls",
+                "success": "✅ Success",
+                "errors": "❌ Errors",
+                "tokens": st.column_config.NumberColumn("Total Tokens", format="%d"),
+                "avg_latency": st.column_config.NumberColumn("Avg Latency (ms)", format="%d"),
+                "avg_tokens": st.column_config.NumberColumn("Avg Tokens/Call", format="%d"),
+            },
+        )
+
+        # Provider pie chart
+        fig_prov = px.pie(
+            df_prov, names="provider", values="calls",
+            title="API Calls by Provider",
+            color_discrete_sequence=["#26a69a", "#7c4dff"],
+        )
+        fig_prov.update_layout(template="plotly_dark", height=300)
+        st.plotly_chart(fig_prov, use_container_width=True)
+
+    st.divider()
+
+    # --- Per-Model Breakdown ---
+    st.subheader("🤖 Usage by Model")
+    model_stats = run_query(
+        f"""
+        SELECT
+            provider,
+            model,
+            COUNT(*) AS calls,
+            COALESCE(SUM(total_tokens), 0) AS tokens,
+            ROUND(AVG(response_time_ms)::numeric, 0) AS avg_latency,
+            ROUND(AVG(total_tokens)::numeric, 0) AS avg_tokens,
+            COUNT(*) FILTER (WHERE status = 'ERROR') AS errors
+        FROM api_usage_log
+        WHERE {api_date_filter}
+        GROUP BY provider, model
+        ORDER BY calls DESC;
+        """
+    )
+    if model_stats:
+        df_model = pd.DataFrame(model_stats)
+        st.dataframe(
+            df_model,
+            use_container_width=True,
+            column_config={
+                "provider": "Provider",
+                "model": "Model",
+                "calls": "API Calls",
+                "tokens": st.column_config.NumberColumn("Total Tokens", format="%d"),
+                "avg_latency": st.column_config.NumberColumn("Avg Latency (ms)", format="%d"),
+                "avg_tokens": st.column_config.NumberColumn("Avg Tokens/Call", format="%d"),
+                "errors": "Errors",
+            },
+        )
+
+    st.divider()
+
+    # --- Daily API Usage Trend ---
+    st.subheader("📈 Daily API Usage Trend")
+    daily_api = run_query(
+        f"""
+        SELECT
+            DATE(created_at) AS date,
+            provider,
+            COUNT(*) AS calls,
+            COALESCE(SUM(total_tokens), 0) AS tokens,
+            ROUND(AVG(response_time_ms)::numeric, 0) AS avg_latency
+        FROM api_usage_log
+        WHERE {api_date_filter}
+        GROUP BY DATE(created_at), provider
+        ORDER BY date;
+        """
+    )
+    if daily_api:
+        df_daily_api = pd.DataFrame(daily_api)
+
+        # Calls per day (stacked by provider)
+        fig_calls = px.bar(
+            df_daily_api, x="date", y="calls", color="provider",
+            title="API Calls per Day",
+            color_discrete_map={"openrouter": "#26a69a", "nvidia": "#7c4dff"},
+            barmode="stack",
+        )
+        fig_calls.update_layout(template="plotly_dark", height=350, xaxis_title="Date", yaxis_title="Calls")
+        st.plotly_chart(fig_calls, use_container_width=True)
+
+        # Tokens per day
+        fig_tokens = px.bar(
+            df_daily_api, x="date", y="tokens", color="provider",
+            title="Tokens Used per Day",
+            color_discrete_map={"openrouter": "#26a69a", "nvidia": "#7c4dff"},
+            barmode="stack",
+        )
+        fig_tokens.update_layout(template="plotly_dark", height=350, xaxis_title="Date", yaxis_title="Tokens")
+        st.plotly_chart(fig_tokens, use_container_width=True)
+
+        # Latency trend
+        daily_latency = run_query(
+            f"""
+            SELECT
+                DATE(created_at) AS date,
+                provider,
+                ROUND(AVG(response_time_ms)::numeric, 0) AS avg_latency,
+                MAX(response_time_ms) AS max_latency
+            FROM api_usage_log
+            WHERE {api_date_filter}
+            GROUP BY DATE(created_at), provider
+            ORDER BY date;
+            """
+        )
+        if daily_latency:
+            df_lat = pd.DataFrame(daily_latency)
+            fig_lat = px.line(
+                df_lat, x="date", y="avg_latency", color="provider",
+                title="Average Response Latency (ms)",
+                color_discrete_map={"openrouter": "#26a69a", "nvidia": "#7c4dff"},
+                markers=True,
+            )
+            fig_lat.update_layout(template="plotly_dark", height=350, xaxis_title="Date", yaxis_title="Latency (ms)")
+            st.plotly_chart(fig_lat, use_container_width=True)
+    else:
+        st.info("ยังไม่มีข้อมูล Daily API Usage")
+
+    st.divider()
+
+    # --- Hourly Heatmap (Today) ---
+    st.subheader("🕐 Hourly Usage (Today)")
+    hourly_api = run_query(
+        """
+        SELECT
+            EXTRACT(HOUR FROM created_at)::int AS hour,
+            COUNT(*) AS calls,
+            COALESCE(SUM(total_tokens), 0) AS tokens
+        FROM api_usage_log
+        WHERE created_at >= date_trunc('day', NOW())
+        GROUP BY EXTRACT(HOUR FROM created_at)
+        ORDER BY hour;
+        """
+    )
+    if hourly_api:
+        df_hourly = pd.DataFrame(hourly_api)
+        fig_hourly = go.Figure()
+        fig_hourly.add_trace(go.Bar(
+            x=df_hourly["hour"],
+            y=df_hourly["calls"],
+            name="Calls",
+            marker_color="#26a69a",
+        ))
+        fig_hourly.update_layout(
+            template="plotly_dark", height=300,
+            xaxis_title="Hour (UTC)", yaxis_title="API Calls",
+            xaxis=dict(dtick=1),
+        )
+        st.plotly_chart(fig_hourly, use_container_width=True)
+    else:
+        st.info("ยังไม่มีข้อมูลวันนี้")
+
+    st.divider()
+
+    # --- Recent API Calls (Raw Log) ---
+    st.subheader("📝 Recent API Calls")
+    recent_limit = st.number_input("จำนวนแถว", 10, 500, 50, key="api_log_limit")
+    recent_api = run_query(
+        """
+        SELECT id, provider, model, prompt_tokens, completion_tokens,
+               total_tokens, response_time_ms, status, created_at
+        FROM api_usage_log
+        ORDER BY created_at DESC
+        LIMIT %s;
+        """,
+        (recent_limit,),
+    )
+    if recent_api:
+        df_recent = pd.DataFrame(recent_api)
+        st.dataframe(
+            df_recent,
+            use_container_width=True,
+            height=400,
+            column_config={
+                "provider": "Provider",
+                "model": "Model",
+                "prompt_tokens": "Prompt Tokens",
+                "completion_tokens": "Completion Tokens",
+                "total_tokens": "Total Tokens",
+                "response_time_ms": st.column_config.NumberColumn("Latency (ms)", format="%d"),
+                "status": "Status",
+                "created_at": "Time",
+            },
+        )
+
+        csv_api = df_recent.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Export API Usage CSV", csv_api, "api_usage.csv", "text/csv")
+    else:
+        st.info("ยังไม่มี API calls")
 
 
 # ==========================================
