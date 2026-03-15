@@ -107,9 +107,29 @@ def is_market_open() -> tuple[bool, str]:
 # ==========================================
 # 1. RISK MANAGEMENT
 # ==========================================
+def _get_live_balance() -> float | None:
+    """ดึง balance จริงจาก MT5 /account endpoint"""
+    windows_ip = os.getenv("WINDOWS_IP")
+    if not windows_ip:
+        return None
+    try:
+        resp = http_session.get(f"http://{windows_ip}:8000/account", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        return float(data["balance"])
+    except Exception as e:
+        print(f"[WARN] ดึง balance จาก MT5 ไม่ได้: {e}")
+        return None
+
+
 def calculate_lot_size() -> dict:
     """คำนวณ Lot Size, SL, TP  →  return dict พร้อมใช้"""
-    balance = float(os.getenv("ACCOUNT_BALANCE", 1000.0))
+    # ดึง balance จริงจาก MT5 ก่อน, fallback เป็นค่าใน .env
+    live_balance = _get_live_balance()
+    env_balance = float(os.getenv("ACCOUNT_BALANCE", 1000.0))
+    balance = live_balance if live_balance is not None else env_balance
+    balance_src = "MT5" if live_balance is not None else ".env"
+
     risk_pct = float(os.getenv("RISK_PERCENT", 1.0))
     sl_points = float(os.getenv("SL_POINTS", 300))
     tp_points = float(os.getenv("TP_POINTS", 600))   # TP default = 2x SL (Risk:Reward 1:2)
@@ -119,7 +139,7 @@ def calculate_lot_size() -> dict:
     final_lot = max(0.01, round(lot_size, 2))
 
     print(
-        f"[INFO] ทุน ${balance} | เสี่ยง {risk_pct}% (${risk_amount}) "
+        f"[INFO] ทุน ${balance:,.2f} ({balance_src}) | เสี่ยง {risk_pct}% (${risk_amount:,.2f}) "
         f"| SL {sl_points} จุด | TP {tp_points} จุด | R:R 1:{tp_points/sl_points:.1f} "
         f"-> ใช้ Lot: {final_lot}"
     )
@@ -687,7 +707,7 @@ def analyze_with_ai(price_data, technical_summary: str = "",
     url = ai_cfg["url"]
     model = ai_cfg["model"]
 
-    max_tokens = int(os.getenv("MAX_TOKENS", 300))
+    max_tokens = int(os.getenv("MAX_TOKENS", 400))
     temperature = float(os.getenv("TEMPERATURE", 0.1))
 
     if not api_key:
@@ -768,37 +788,47 @@ def analyze_with_ai(price_data, technical_summary: str = "",
     }
 
     import time as _time
-    t_start = _time.time()
-    try:
-        response = http_session.post(url, headers=headers, json=payload, timeout=15)
-        response.raise_for_status()
-        resp_json = response.json()
-        elapsed_ms = int((_time.time() - t_start) * 1000)
+    max_retries = 2
+    last_error = None
 
-        # บันทึก API usage
-        usage = resp_json.get("usage", {})
-        save_api_usage(
-            provider=ai_cfg["provider"],
-            model=model,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-            response_time_ms=elapsed_ms,
-            status="OK",
-        )
+    for attempt in range(1, max_retries + 1):
+        t_start = _time.time()
+        try:
+            response = http_session.post(url, headers=headers, json=payload, timeout=15)
+            response.raise_for_status()
+            resp_json = response.json()
+            elapsed_ms = int((_time.time() - t_start) * 1000)
 
-        return resp_json["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        elapsed_ms = int((_time.time() - t_start) * 1000)
-        save_api_usage(
-            provider=ai_cfg["provider"],
-            model=model,
-            prompt_tokens=0, completion_tokens=0, total_tokens=0,
-            response_time_ms=elapsed_ms,
-            status="ERROR",
-        )
-        print(f"[ERROR] AI API ล้มเหลว: {e}")
-        return "ERROR"
+            # บันทึก API usage
+            usage = resp_json.get("usage", {})
+            save_api_usage(
+                provider=ai_cfg["provider"],
+                model=model,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+                response_time_ms=elapsed_ms,
+                status="OK",
+            )
+
+            return resp_json["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            elapsed_ms = int((_time.time() - t_start) * 1000)
+            last_error = e
+            save_api_usage(
+                provider=ai_cfg["provider"],
+                model=model,
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                response_time_ms=elapsed_ms,
+                status="ERROR",
+            )
+            if attempt < max_retries:
+                print(f"[WARN] AI API attempt {attempt}/{max_retries} ล้มเหลว: {e} – retry...")
+                _time.sleep(2)
+            else:
+                print(f"[ERROR] AI API ล้มเหลว (หลัง {max_retries} ครั้ง): {e}")
+
+    return "ERROR"
 
 
 def save_api_usage(provider, model, prompt_tokens, completion_tokens,
@@ -1011,7 +1041,7 @@ def get_today_trade_count() -> int:
 # ==========================================
 # MAIN LOOP – รันแบบ Background Service
 # ==========================================
-MARKET_CLOSED_CHECK_SEC = 60  # เมื่อตลาดปิด เช็คซ้ำทุก 60 วินาที
+MARKET_CLOSED_CHECK_SEC = 300  # เมื่อตลาดปิด เช็คซ้ำทุก 5 นาที (ลด resource usage)
 CONSECUTIVE_ERR_LIMIT = 5     # ผิดพลาดติดต่อกัน 5 ครั้ง -> หยุดอัตโนมัติ
 
 
