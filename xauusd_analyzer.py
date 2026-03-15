@@ -185,16 +185,37 @@ def send_trade_to_mt5(action: str, symbol: str, lot: float,
 # ==========================================
 # 3. AI ANALYSIS (OPTIMIZED LATENCY)
 # ==========================================
+def _get_ai_config() -> dict:
+    """Return API config based on AI_PROVIDER env var."""
+    provider = os.getenv("AI_PROVIDER", "openrouter").lower()
+
+    if provider == "nvidia":
+        return {
+            "provider": "nvidia",
+            "api_key": os.getenv("NVIDIA_API_KEY"),
+            "url": os.getenv("NVIDIA_URL", "https://integrate.api.nvidia.com/v1/chat/completions"),
+            "model": os.getenv("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"),
+        }
+    else:
+        return {
+            "provider": "openrouter",
+            "api_key": os.getenv("OPENROUTER_API_KEY"),
+            "url": os.getenv("OPENROUTER_URL"),
+            "model": os.getenv("MODEL"),
+        }
+
+
 def analyze_with_ai(price_data) -> str:
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    url = os.getenv("OPENROUTER_URL")
-    model = os.getenv("MODEL")
+    ai_cfg = _get_ai_config()
+    api_key = ai_cfg["api_key"]
+    url = ai_cfg["url"]
+    model = ai_cfg["model"]
 
     max_tokens = int(os.getenv("MAX_TOKENS", 100))
     temperature = float(os.getenv("TEMPERATURE", 0.1))
 
     if not api_key:
-        print("[ERROR] ไม่พบ OPENROUTER_API_KEY ใน .env")
+        print(f"[ERROR] ไม่พบ API Key สำหรับ provider '{ai_cfg['provider']}' ใน .env")
         return "ERROR"
 
     system_prompt = (
@@ -467,7 +488,8 @@ def main_loop():
             tp_points = risk["tp_points"]
 
             # ---- 3. AI วิเคราะห์ ----
-            print(f"[INFO] ส่งข้อมูลให้ AI ({os.getenv('MODEL')})...")
+            ai_cfg = _get_ai_config()
+            print(f"[INFO] ส่งข้อมูลให้ AI ({ai_cfg['provider']}: {ai_cfg['model']})...")
             analysis = analyze_with_ai(price)
             print(f"\n>>> 🤖 AI RESULT <<<\n{analysis}\n{'='*30}")
 
