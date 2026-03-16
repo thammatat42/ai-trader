@@ -1500,7 +1500,10 @@ st.sidebar.divider()
 
 # Show AI provider info
 ai_provider = os.getenv("AI_PROVIDER", "openrouter").lower()
-ai_model = os.getenv("MODEL", os.getenv("NVIDIA_MODEL", "N/A"))
+if ai_provider == "nvidia":
+    ai_model = os.getenv("NVIDIA_MODEL", "N/A")
+else:
+    ai_model = os.getenv("MODEL", "N/A")
 st.sidebar.markdown(f"""
 <div class="text-muted">
 <b class="gold-accent">Engine:</b> {ai_model}<br>
