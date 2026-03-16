@@ -363,6 +363,7 @@ def get_history(days: int = Query(default=7, ge=1, le=90)):
         result.append({
             "ticket": d.ticket,
             "order": d.order,
+            "position": d.position_id,
             "symbol": d.symbol,
             "type": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
             "entry": entry_type,

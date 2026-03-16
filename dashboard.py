@@ -22,11 +22,160 @@ load_dotenv()
 # PAGE CONFIG
 # ==========================================
 st.set_page_config(
-    page_title="AI Trader Dashboard",
-    page_icon="📊",
+    page_title="AI Gold Trader Dashboard",
+    page_icon="🥇",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ==========================================
+# ENTERPRISE DARK THEME CSS
+# ==========================================
+st.markdown("""
+<style>
+/* ===== GLOBAL DARK THEME ===== */
+[data-testid="stAppViewContainer"] {
+    background: linear-gradient(135deg, #0a0e17 0%, #111827 50%, #0f172a 100%);
+}
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+    border-right: 1px solid #1e293b;
+}
+[data-testid="stHeader"] {
+    background: transparent;
+}
+
+/* ===== METRIC CARDS ===== */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #1e293b 0%, #162032 100%);
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 16px 20px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+[data-testid="stMetricLabel"] {
+    color: #94a3b8 !important;
+    font-size: 0.8rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+[data-testid="stMetricValue"] {
+    color: #f1f5f9 !important;
+    font-weight: 700 !important;
+}
+
+/* ===== BUTTONS ===== */
+.stButton > button {
+    border-radius: 8px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    transition: all 0.2s;
+}
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    border: none;
+    color: #0f172a;
+}
+.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+    box-shadow: 0 4px 16px rgba(245,158,11,0.3);
+}
+
+/* ===== DATAFRAMES / TABLES ===== */
+[data-testid="stDataFrame"] {
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #1e293b;
+}
+
+/* ===== FORM CONTAINER ===== */
+[data-testid="stForm"] {
+    background: linear-gradient(135deg, #1e293b 0%, #162032 100%);
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 24px;
+}
+
+/* ===== SECTION HEADERS ===== */
+h1 {
+    color: #f1f5f9 !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.5px;
+}
+h2, h3 {
+    color: #e2e8f0 !important;
+    font-weight: 600 !important;
+}
+
+/* ===== DIVIDER ===== */
+hr {
+    border-color: #1e293b !important;
+}
+
+/* ===== CUSTOM CARD CLASS ===== */
+.card-panel {
+    background: linear-gradient(135deg, #1e293b 0%, #162032 100%);
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+}
+.card-panel h4 {
+    color: #f59e0b;
+    margin-top: 0;
+    font-weight: 700;
+}
+.gold-accent { color: #f59e0b; }
+.green-accent { color: #22c55e; }
+.red-accent { color: #ef4444; }
+.text-muted { color: #94a3b8; font-size: 0.85rem; }
+
+/* ===== STATUS BADGES ===== */
+.status-running {
+    display: inline-block;
+    background: linear-gradient(135deg, #22c55e33, #16a34a33);
+    border: 1px solid #22c55e;
+    color: #22c55e;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+.status-stopped {
+    display: inline-block;
+    background: linear-gradient(135deg, #ef444433, #dc262633);
+    border: 1px solid #ef4444;
+    color: #ef4444;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+/* ===== SIDEBAR STYLING ===== */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
+    color: #f59e0b !important;
+    font-size: 1.3rem !important;
+}
+
+/* ===== EXPANDER ===== */
+[data-testid="stExpander"] {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+}
+
+/* ===== INFO/SUCCESS/ERROR ===== */
+[data-testid="stAlert"] {
+    border-radius: 8px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ==========================================
 # DB HELPER
@@ -134,23 +283,26 @@ def sync_mt5_to_db():
     # --- Sync Closed Deals (last 30 days) ---
     hist_data = mt5_api("/history", params={"days": 30})
     if hist_data and hist_data.get("deals"):
-        # Separate IN (open) and OUT (close) deals, pair by order_id
+        # Separate IN (open) and OUT (close) deals, pair by position_id
         in_deals = {}
         out_deals = {}
         for d in hist_data["deals"]:
+            pos_id = d.get("position", d["order"])
             if d.get("entry") == "IN":
-                in_deals[d["order"]] = d
+                in_deals[pos_id] = d
             elif d.get("entry") in ("OUT", "INOUT"):
-                out_deals[d["order"]] = d
+                out_deals[pos_id] = d
             else:
                 # Legacy format (no entry field) → treat as OUT
-                out_deals[d["order"]] = d
+                out_deals[pos_id] = d
 
-        # UPSERT paired trades (have both open and close)
-        for order_id, out_deal in out_deals.items():
-            in_deal = in_deals.get(order_id, {})
+        # UPSERT paired trades — use IN deal's order as DB key
+        for pos_id, out_deal in out_deals.items():
+            in_deal = in_deals.get(pos_id, {})
             open_price = in_deal.get("price")
             open_time = in_deal.get("time", out_deal["time"])
+            # DB order_id = opening order (IN deal's order)
+            db_order_id = in_deal.get("order", out_deal["order"])
             # action = direction of the original open deal
             action = in_deal.get("type", out_deal["type"])
             try:
@@ -168,7 +320,7 @@ def sync_mt5_to_db():
                         status = 'CLOSED',
                         closed_at = EXCLUDED.closed_at;
                     """,
-                    (order_id, out_deal["symbol"], action, out_deal["lot"],
+                    (db_order_id, out_deal["symbol"], action, out_deal["lot"],
                      open_price, out_deal["price"],
                      out_deal["profit"], open_time, out_deal["time"]),
                 )
@@ -177,21 +329,24 @@ def sync_mt5_to_db():
                 pass
 
     # --- Mark positions closed if they disappeared from MT5 ---
+    # Only mark as closed; actual close_price/profit come from history sync above
     if pos_data is not None:
         open_tickets = [p["ticket"] for p in pos_data.get("positions", [])]
         if open_tickets:
             placeholders = ",".join(["%s"] * len(open_tickets))
             run_command(
                 f"""
-                UPDATE trades SET status = 'CLOSED', closed_at = NOW()
-                WHERE status = 'OPEN' AND order_id NOT IN ({placeholders});
+                UPDATE trades SET status = 'CLOSED', closed_at = COALESCE(closed_at, NOW())
+                WHERE status = 'OPEN' AND order_id NOT IN ({placeholders})
+                  AND close_price IS NOT NULL;
                 """,
                 tuple(open_tickets),
             )
         else:
-            # No open positions at all → close all OPEN in DB
+            # No open positions at all → close only trades that already have close data
             run_command(
-                "UPDATE trades SET status = 'CLOSED', closed_at = NOW() WHERE status = 'OPEN';"
+                """UPDATE trades SET status = 'CLOSED', closed_at = COALESCE(closed_at, NOW())
+                   WHERE status = 'OPEN' AND close_price IS NOT NULL;"""
             )
 
     return synced
@@ -200,10 +355,13 @@ def sync_mt5_to_db():
 # ==========================================
 # SIDEBAR – NAVIGATION
 # ==========================================
-st.sidebar.title("🧭 Navigation")
+st.sidebar.markdown("# 🥇 AI Gold Trader")
+st.sidebar.caption("Enterprise Dashboard v2.0")
+st.sidebar.divider()
 page = st.sidebar.radio(
-    "เลือกหน้า",
+    "Navigation",
     ["🏠 Overview", "📊 Trade Reports", "📈 Analysis Log", "🎛️ Bot Control", "📋 Event Log", "🔑 API Usage"],
+    label_visibility="collapsed",
 )
 
 # Auto-refresh toggle
@@ -217,43 +375,115 @@ if auto_refresh:
 # PAGE: OVERVIEW
 # ==========================================
 if page == "🏠 Overview":
-    st.title("🏠 AI Trader – Overview")
+    st.markdown("## 🥇 AI Gold Trader — Dashboard")
 
-    # --- Market Status ---
+    # ── System Status Bar ──
     now_utc = datetime.now(timezone.utc)
     wd = now_utc.weekday()
     h = now_utc.hour
     market_open = True
-    market_msg = "🟢 Market OPEN"
+    market_msg = "🟢 OPEN"
     if wd == 5:
         market_open = False
-        market_msg = "🌙 Market CLOSED (Saturday)"
+        market_msg = "🔴 CLOSED (Sat)"
     elif wd == 6 and h < 23:
         market_open = False
-        market_msg = "🌙 Market CLOSED (Sunday - opens 23:00 UTC)"
+        market_msg = "🔴 CLOSED (Sun)"
     elif wd == 4 and h >= 22:
         market_open = False
-        market_msg = "🌙 Market CLOSED (Weekend started)"
+        market_msg = "🔴 CLOSED (Weekend)"
     elif h == 22:
         market_open = False
-        market_msg = "⏸️ Daily break (22:00-23:00 UTC)"
+        market_msg = "⏸️ Break (22-23 UTC)"
 
-    # --- Bot Status ---
     settings = run_query("SELECT * FROM bot_settings LIMIT 1;")
+    bot_running = settings[0]["is_running"] if settings else False
+
+    # ── Account Overview Cards ──
+    account_info = mt5_api("/account")
+
+    # Top status row
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("Market", market_msg)
+    s2.metric("Bot", "🟢 RUNNING" if bot_running else "🔴 STOPPED")
     if settings:
-        s = settings[0]
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        col1.metric("Market", market_msg)
-        col2.metric("Bot Status", "🟢 RUNNING" if s["is_running"] else "🔴 STOPPED")
-        col3.metric("Interval", f"{s['interval_seconds']}s")
-        col4.metric("Scalp TF", s.get("scalp_timeframe", "M15"))
-        col5.metric("Max Trades/Day", s["max_trades_per_day"])
-        col6.metric("UTC Time", now_utc.strftime("%H:%M:%S"))
+        s3.metric("Interval", f"{settings[0]['interval_seconds']}s")
+        s4.metric("Scalp TF", settings[0].get("scalp_timeframe", "M15"))
+        s5.metric("Max Trades", settings[0]["max_trades_per_day"])
+    s6.metric("UTC", now_utc.strftime("%H:%M:%S"))
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Account overview row
+    if account_info and "balance" in account_info:
+        ac1, ac2, ac3, ac4 = st.columns(4)
+        ac1.metric("💰 Balance", f"${account_info['balance']:,.2f}")
+        ac2.metric("📊 Equity", f"${account_info['equity']:,.2f}")
+        unrealized = account_info.get("profit", 0)
+        ac3.metric("📈 Unrealized P/L",
+                    f"${unrealized:+,.2f}",
+                    delta=f"${unrealized:+,.2f}",
+                    delta_color="normal")
+        ac4.metric("🏦 Free Margin", f"${account_info['free_margin']:,.2f}")
 
     st.divider()
 
-    # --- Quick Stats ---
-    st.subheader("📊 Quick Stats (Last 24h)")
+    # ── Active Positions ──
+    st.markdown("### 📌 Active Positions")
+    pos_data = mt5_api("/positions")
+    if pos_data and pos_data.get("positions"):
+        positions = pos_data["positions"]
+        total_unrealized = sum(p.get("profit", 0) for p in positions)
+        pc1, pc2 = st.columns(2)
+        pc1.metric("Open Trades", len(positions))
+        pc2.metric("Unrealized P/L", f"${total_unrealized:+,.2f}",
+                    delta=f"${total_unrealized:+,.2f}",
+                    delta_color="normal")
+        df_pos = pd.DataFrame(positions)
+        display_cols = ["ticket", "symbol", "type", "lot", "open_price",
+                        "current_price", "sl", "tp", "profit", "swap"]
+        existing_cols = [c for c in display_cols if c in df_pos.columns]
+        st.dataframe(
+            df_pos[existing_cols],
+            use_container_width=True,
+            column_config={
+                "profit": st.column_config.NumberColumn("P/L ($)", format="$%.2f"),
+                "open_price": st.column_config.NumberColumn("Entry", format="%.2f"),
+                "current_price": st.column_config.NumberColumn("Current", format="%.2f"),
+            },
+        )
+    else:
+        st.info("No active positions")
+
+    st.divider()
+
+    # ── Live AI Insight ──
+    st.markdown("### 🧠 Live AI Insight")
+    latest = run_query(
+        """
+        SELECT trade_action, ai_recommendation, bid, ask, lot_size,
+               sl_price, tp_price, created_at
+        FROM ai_analysis_log
+        ORDER BY created_at DESC LIMIT 1;
+        """
+    )
+    if latest and latest[0]:
+        ai = latest[0]
+        action_color = "#22c55e" if ai["trade_action"] == "BUY" else (
+            "#ef4444" if ai["trade_action"] == "SELL" else "#94a3b8"
+        )
+        ai_col1, ai_col2, ai_col3, ai_col4 = st.columns(4)
+        ai_col1.metric("Signal", ai["trade_action"])
+        ai_col2.metric("Bid / Ask", f"{ai['bid']:.2f} / {ai['ask']:.2f}")
+        ai_col3.metric("Lot Size", f"{ai['lot_size']}")
+        ai_col4.metric("Time", ai["created_at"].strftime("%H:%M:%S") if ai["created_at"] else "N/A")
+        with st.expander("📝 Full AI Analysis", expanded=False):
+            st.text(ai["ai_recommendation"] or "No recommendation")
+
+    st.divider()
+
+    # ── Quick Stats (24h) ──
+    st.markdown("### 📊 Quick Stats (Last 24h)")
 
     rows = run_query(
         """
@@ -276,13 +506,33 @@ if page == "🏠 Overview":
         c3.metric("🔴 Bearish", r["bearish"])
         c4.metric("⚪ Neutral", r["neutral"])
 
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Avg Bid", r["avg_bid"])
-        c6.metric("Avg Ask", r["avg_ask"])
-        c7.metric("Avg Lot", r["avg_lot"])
+    # ── Recent Trade History (last 5) ──
+    st.markdown("### 📜 Recent Trades")
+    recent_trades = run_query(
+        """
+        SELECT order_id, action, lot, open_price, close_price, profit,
+               opened_at, closed_at, status
+        FROM trades
+        ORDER BY COALESCE(closed_at, opened_at) DESC
+        LIMIT 5;
+        """
+    )
+    if recent_trades:
+        df_recent = pd.DataFrame(recent_trades)
+        st.dataframe(
+            df_recent,
+            use_container_width=True,
+            column_config={
+                "profit": st.column_config.NumberColumn("P/L ($)", format="$%.2f"),
+                "open_price": st.column_config.NumberColumn("Entry", format="%.2f"),
+                "close_price": st.column_config.NumberColumn("Exit", format="%.2f"),
+            },
+        )
+    else:
+        st.info("No trade history yet")
 
-    # --- Price Chart ---
-    st.subheader("💹 Bid / Ask Price (Last 24h)")
+    # ── Price Chart ──
+    st.markdown("### 💹 Price Chart (24h)")
     price_rows = run_query(
         """
         SELECT created_at, bid, ask
@@ -294,23 +544,39 @@ if page == "🏠 Overview":
     if price_rows:
         df = pd.DataFrame(price_rows)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df["created_at"], y=df["bid"], name="Bid", line=dict(color="#26a69a")))
-        fig.add_trace(go.Scatter(x=df["created_at"], y=df["ask"], name="Ask", line=dict(color="#ef5350")))
-        fig.update_layout(height=400, xaxis_title="Time", yaxis_title="Price", template="plotly_dark")
+        fig.add_trace(go.Scatter(x=df["created_at"], y=df["bid"], name="Bid",
+                                  line=dict(color="#22c55e", width=2)))
+        fig.add_trace(go.Scatter(x=df["created_at"], y=df["ask"], name="Ask",
+                                  line=dict(color="#ef4444", width=2)))
+        fig.update_layout(
+            height=400,
+            xaxis_title="Time",
+            yaxis_title="Price (USD)",
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(15,23,42,0.8)",
+            font=dict(color="#94a3b8"),
+        )
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("ยังไม่มีข้อมูลราคาใน 24 ชั่วโมงที่ผ่านมา")
+        st.info("No price data in last 24 hours")
 
-    # --- Sentiment Pie ---
+    # ── Sentiment Pie ──
     if rows and rows[0] and rows[0]["total"] > 0:
-        st.subheader("🧠 Sentiment Distribution (24h)")
+        st.markdown("### 🧠 Sentiment Distribution (24h)")
         r = rows[0]
         fig_pie = px.pie(
             names=["Bullish", "Bearish", "Neutral"],
             values=[r["bullish"], r["bearish"], r["neutral"]],
-            color_discrete_sequence=["#26a69a", "#ef5350", "#78909c"],
+            color_discrete_sequence=["#22c55e", "#ef4444", "#64748b"],
         )
-        fig_pie.update_layout(template="plotly_dark", height=350)
+        fig_pie.update_layout(
+            template="plotly_dark",
+            height=350,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(15,23,42,0.8)",
+            font=dict(color="#94a3b8"),
+        )
         st.plotly_chart(fig_pie, use_container_width=True)
 
 
@@ -318,16 +584,14 @@ if page == "🏠 Overview":
 # PAGE: TRADE REPORTS  (Pro Trader Dashboard)
 # ==========================================
 elif page == "📊 Trade Reports":
-    st.title("📊 Trade Reports – Pro Dashboard")
+    st.markdown("## 📊 Trade Reports")
 
     # ----- SYNC MT5 → DB on page load -----
-    windows_ip = os.getenv("WINDOWS_IP", "")
-
-    with st.spinner("🔄 กำลังซิงค์ข้อมูลจาก MT5..."):
+    with st.spinner("🔄 Syncing trades from MT5..."):
         synced_count = sync_mt5_to_db()
 
     # ----- ACCOUNT INFO (Live from MT5) -----
-    st.subheader("💰 Account Overview")
+    st.markdown("### 💰 Account Overview")
     account_info = mt5_api("/account")
 
     if account_info and "balance" in account_info:
@@ -341,12 +605,12 @@ elif page == "📊 Trade Reports":
                     delta=f"${account_info['profit']:+,.2f}",
                     delta_color="normal")
     else:
-        st.info("⚠️ ไม่สามารถเชื่อมต่อ MT5 ได้ – แสดงเฉพาะข้อมูลจาก Database")
+        st.info("⚠️ Cannot connect to MT5 — showing DB data only")
 
     st.divider()
 
     # ----- OPEN POSITIONS (Live from MT5 API) -----
-    st.subheader("📌 Open Positions")
+    st.markdown("### 📌 Open Positions")
     pos_data = mt5_api("/positions")
     if pos_data and pos_data.get("positions"):
         positions = pos_data["positions"]
@@ -375,14 +639,14 @@ elif page == "📊 Trade Reports":
                         delta_color="normal")
             st.dataframe(df_open, use_container_width=True)
         else:
-            st.info("ไม่มี Open Position ขณะนี้")
+            st.info("No active positions")
 
     st.divider()
 
     # ----- PERIOD SELECTOR -----
-    st.subheader("📆 Performance Summary")
+    st.markdown("### 📆 Performance Summary")
     period = st.radio(
-        "เลือกช่วงเวลา",
+        "Select Period",
         ["Today", "Yesterday", "This Week", "This Month", "Last 7 Days", "Last 30 Days", "All Time"],
         horizontal=True,
     )
@@ -462,12 +726,12 @@ elif page == "📊 Trade Reports":
 
         st.caption(f"📐 Expectancy per trade: **${expectancy:+,.2f}**  |  Total Lots: **{float(s['total_lots']):.2f}**")
     else:
-        st.info("ยังไม่มี Closed Trade ในช่วงเวลานี้")
+        st.info("No closed trades in this period")
 
     st.divider()
 
     # ----- EQUITY CURVE -----
-    st.subheader("📈 Equity Curve (Cumulative P/L)")
+    st.markdown("### 📈 Equity Curve")
     equity_rows = run_query(
         """
         SELECT closed_at, profit,
@@ -495,13 +759,16 @@ elif page == "📊 Trade Reports":
             xaxis_title="Date",
             yaxis_title="Cumulative P/L ($)",
             template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(15,23,42,0.8)",
+            font=dict(color="#94a3b8"),
         )
         st.plotly_chart(fig_eq, use_container_width=True)
     else:
-        st.info("ยังไม่มีข้อมูล Equity Curve")
+        st.info("No equity data yet")
 
     # ----- DAILY P&L BAR CHART -----
-    st.subheader("📊 Daily P&L")
+    st.markdown("### 📊 Daily P&L")
     daily_pnl = run_query(
         """
         SELECT DATE(closed_at) AS trade_date,
@@ -534,6 +801,9 @@ elif page == "📊 Trade Reports":
             xaxis_title="Date",
             yaxis_title="P/L ($)",
             template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(15,23,42,0.8)",
+            font=dict(color="#94a3b8"),
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
@@ -550,12 +820,12 @@ elif page == "📊 Trade Reports":
             },
         )
     else:
-        st.info("ยังไม่มีข้อมูล Daily P&L")
+        st.info("No daily P&L data")
 
     st.divider()
 
     # ----- WEEKLY SUMMARY -----
-    st.subheader("📅 Weekly Summary")
+    st.markdown("### 📅 Weekly Summary")
     weekly_pnl = run_query(
         """
         SELECT date_trunc('week', closed_at)::date AS week_start,
@@ -586,10 +856,10 @@ elif page == "📊 Trade Reports":
             },
         )
     else:
-        st.info("ยังไม่มีข้อมูล Weekly Summary")
+        st.info("No weekly data")
 
     # ----- MONTHLY SUMMARY -----
-    st.subheader("📅 Monthly Summary")
+    st.markdown("### 📅 Monthly Summary")
     monthly_pnl = run_query(
         """
         SELECT to_char(closed_at, 'YYYY-MM') AS month,
@@ -622,13 +892,13 @@ elif page == "📊 Trade Reports":
             },
         )
     else:
-        st.info("ยังไม่มีข้อมูล Monthly Summary")
+        st.info("No monthly data")
 
     st.divider()
 
     # ----- TRADE HISTORY TABLE -----
-    st.subheader("📜 Trade History (All Closed Trades)")
-    history_limit = st.number_input("จำนวนแถวสูงสุด", 10, 1000, 100, key="hist_limit")
+    st.markdown("### 📜 Trade History")
+    history_limit = st.number_input("Max rows", 10, 1000, 100, key="hist_limit")
     history_rows = run_query(
         """
         SELECT order_id, symbol, action, lot, open_price, close_price,
@@ -656,10 +926,10 @@ elif page == "📊 Trade Reports":
         csv_hist = df_hist.to_csv(index=False).encode("utf-8")
         st.download_button("📥 Export Trade History CSV", csv_hist, "trade_history.csv", "text/csv")
     else:
-        st.info("ยังไม่มี Closed Trade")
+        st.info("No closed trades")
 
     # ----- WIN/LOSS DISTRIBUTION -----
-    st.subheader("📊 Profit Distribution")
+    st.markdown("### 📊 Profit Distribution")
     dist_rows = run_query(
         """
         SELECT profit FROM trades
@@ -674,7 +944,12 @@ elif page == "📊 Trade Reports":
             labels={"profit": "Profit ($)", "count": "Count"},
         )
         fig_dist.add_vline(x=0, line_dash="dash", line_color="red", opacity=0.7)
-        fig_dist.update_layout(template="plotly_dark", height=350)
+        fig_dist.update_layout(
+            template="plotly_dark", height=350,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(15,23,42,0.8)",
+            font=dict(color="#94a3b8"),
+        )
         st.plotly_chart(fig_dist, use_container_width=True)
 
 
@@ -682,14 +957,14 @@ elif page == "📊 Trade Reports":
 # PAGE: ANALYSIS LOG
 # ==========================================
 elif page == "📈 Analysis Log":
-    st.title("📈 Analysis Log")
+    st.markdown("## 📈 Analysis Log")
 
     # Filters
     col_f1, col_f2 = st.columns(2)
     with col_f1:
-        hours = st.slider("ดูย้อนหลัง (ชั่วโมง)", 1, 168, 24)
+        hours = st.slider("Lookback (hours)", 1, 168, 24)
     with col_f2:
-        limit = st.number_input("จำนวนแถวสูงสุด", 10, 5000, 200)
+        limit = st.number_input("Max rows", 10, 5000, 200)
 
     log_rows = run_query(
         """
@@ -731,29 +1006,34 @@ elif page == "📈 Analysis Log":
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("📥 Export CSV", csv, "analysis_log.csv", "text/csv")
     else:
-        st.info("ไม่พบข้อมูล")
+        st.info("No analysis data found")
 
 
 # ==========================================
 # PAGE: BOT CONTROL
 # ==========================================
 elif page == "🎛️ Bot Control":
-    st.title("🎛️ Bot Control Panel")
+    st.markdown("## 🎛️ Control Panel")
 
     settings = run_query("SELECT * FROM bot_settings LIMIT 1;")
     if not settings:
-        st.error("ไม่พบข้อมูลใน bot_settings – กรุณารัน db/init.sql ก่อน")
+        st.error("No bot_settings found — run db/init.sql first")
         st.stop()
 
     s = settings[0]
 
-    # --- Kill Switch ---
-    st.subheader("🔴 Kill Switch / Start-Stop")
-    col_a, col_b, col_c = st.columns(3)
+    # --- System Status + Kill Switch ---
+    st.markdown("### ⚡ System Status")
+    col_status, col_action, col_emergency = st.columns(3)
 
-    with col_a:
+    with col_status:
         if s["is_running"]:
-            st.success("Bot กำลังทำงาน 🟢")
+            st.markdown('<span class="status-running">● SYSTEM ACTIVE</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="status-stopped">● SYSTEM OFFLINE</span>', unsafe_allow_html=True)
+
+    with col_action:
+        if s["is_running"]:
             if st.button("⏹️  STOP BOT", type="primary", use_container_width=True):
                 run_command("UPDATE bot_settings SET is_running = FALSE, updated_at = NOW();")
                 run_command(
@@ -762,7 +1042,6 @@ elif page == "🎛️ Bot Control":
                 )
                 st.rerun()
         else:
-            st.error("Bot หยุดทำงาน 🔴")
             if st.button("▶️  START BOT", type="primary", use_container_width=True):
                 run_command("UPDATE bot_settings SET is_running = TRUE, updated_at = NOW();")
                 run_command(
@@ -771,21 +1050,36 @@ elif page == "🎛️ Bot Control":
                 )
                 st.rerun()
 
-    with col_c:
-        st.info("🔄 Restart = Stop + Start")
-        if st.button("🔄 RESTART BOT", use_container_width=True):
-            run_command("UPDATE bot_settings SET is_running = TRUE, updated_at = NOW();")
+    with col_emergency:
+        if st.button("🚨 EMERGENCY CLOSE ALL", type="secondary", use_container_width=True):
+            # Close all open positions via MT5
+            pos_data = mt5_api("/positions")
+            closed = 0
+            if pos_data and pos_data.get("positions"):
+                import requests
+                windows_ip = os.getenv("WINDOWS_IP", "")
+                for p in pos_data["positions"]:
+                    try:
+                        requests.post(
+                            f"http://{windows_ip}:8000/close",
+                            json={"ticket": p["ticket"]},
+                            timeout=10,
+                        )
+                        closed += 1
+                    except Exception:
+                        pass
+            run_command("UPDATE bot_settings SET is_running = FALSE, updated_at = NOW();")
             run_command(
                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
-                ("RESTART", "Bot restarted from Dashboard"),
+                ("KILL_SWITCH", f"Emergency close all — closed {closed} positions"),
             )
-            st.success("✅ Bot ถูกรีสตาร์ท – กำลังกลับมาทำงาน")
+            st.warning(f"🚨 Emergency executed — closed {closed} positions, bot stopped")
             st.rerun()
 
     st.divider()
 
     # --- Settings ---
-    st.subheader("⚙️ Bot Settings")
+    st.markdown("### ⚙️ Configuration")
 
     # ดึงค่าปัจจุบัน (รองรับ column ใหม่)
     current_max_retries = s.get("pause_max_retries", 5)
@@ -794,19 +1088,19 @@ elif page == "🎛️ Bot Control":
     with st.form("settings_form"):
         st.markdown("##### ⏱️ Trading Interval")
         new_interval = st.selectbox(
-            "Interval (วินาที)",
+            "Interval",
             options=[60, 120, 300, 600, 900, 1800, 3600],
             index=[60, 120, 300, 600, 900, 1800, 3600].index(s["interval_seconds"])
             if s["interval_seconds"] in [60, 120, 300, 600, 900, 1800, 3600]
             else 2,
             format_func=lambda x: {
-                60: "1 นาที",
-                120: "2 นาที",
-                300: "5 นาที",
-                600: "10 นาที",
-                900: "15 นาที",
-                1800: "30 นาที",
-                3600: "1 ชั่วโมง",
+                60: "1 min",
+                120: "2 min",
+                300: "5 min",
+                600: "10 min",
+                900: "15 min",
+                1800: "30 min",
+                3600: "1 hour",
             }.get(x, f"{x}s"),
         )
 
@@ -814,31 +1108,31 @@ elif page == "🎛️ Bot Control":
         scalp_tf_options = ["M1", "M5", "M15", "M30"]
         current_scalp_tf = s.get("scalp_timeframe", "M15")
         new_scalp_tf = st.selectbox(
-            "Scalp Timeframe (ใช้วิเคราะห์จังหวะสั้น + AI Prompt)",
+            "Scalp Timeframe (short-term analysis + AI prompt)",
             options=scalp_tf_options,
             index=scalp_tf_options.index(current_scalp_tf)
             if current_scalp_tf in scalp_tf_options
             else 2,
-            help="Timeframe สำหรับ Scalp ที่ Bot จะใช้วิเคราะห์ (M1/M5/M15/M30) — เปลี่ยนได้ทันทีโดยไม่ต้อง restart",
+            help="Timeframe for scalp analysis (M1/M5/M15/M30) — changes take effect immediately without restart",
         )
 
         new_max_trades = st.number_input(
             "Max Trades / Day", min_value=1, max_value=100, value=s["max_trades_per_day"]
         )
 
-        st.markdown("##### ⏸️ Breakpoint / Pause Settings")
+        st.markdown("##### ⏸️ Pause Settings")
         bp_col1, bp_col2 = st.columns(2)
         with bp_col1:
             new_max_retries = st.number_input(
                 "Max Pause Retries",
                 min_value=0, max_value=100, value=current_max_retries,
-                help="จำนวนครั้งที่ Bot จะ retry ขณะถูก STOP ก่อน shutdown อัตโนมัติ (0 = ไม่จำกัด, retry ตลอด)",
+                help="Number of retries while bot is STOPPED before auto shutdown (0 = unlimited)",
             )
         with bp_col2:
             new_retry_sec = st.number_input(
-                "Pause Retry Interval (วินาที)",
+                "Pause Retry Interval (sec)",
                 min_value=5, max_value=300, value=current_retry_sec,
-                help="เวลา (วินาที) ระหว่าง retry แต่ละครั้งขณะถูก STOP",
+                help="Wait time (seconds) between retries while STOPPED",
             )
 
         submitted = st.form_submit_button("💾 Save Settings")
@@ -857,19 +1151,19 @@ elif page == "🎛️ Bot Control":
                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
                 ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, scalp_tf={new_scalp_tf}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
             )
-            st.success("✅ บันทึกสำเร็จ!")
+            st.success("✅ Settings saved!")
             st.rerun()
 
     st.divider()
     st.subheader("💡 Interval & Timeframe Guide")
     st.markdown(
         """
-        | Scalp TF | Interval ที่เหมาะสม | เหตุผล |
+        | Scalp TF | Recommended Interval | Strategy |
         |----------|---------------------|--------|
-        | **M5** | 1-2 นาที (60-120s) | Scalp ระยะสั้นมาก |
-        | **M15** | 5 นาที (300s) | Scalp มาตรฐาน แนะนำ |
-        | **M30** | 10 นาที (600s) | Short Swing |
-        | **H1** | 15-30 นาที | Swing / Position |
+        | **M5** | 1-2 min (60-120s) | Ultra-short scalp |
+        | **M15** | 5 min (300s) | Standard scalp (recommended) |
+        | **M30** | 10 min (600s) | Short swing |
+        | **H1** | 15-30 min | Swing / Position |
         """
     )
 
@@ -878,7 +1172,7 @@ elif page == "🎛️ Bot Control":
 # PAGE: EVENT LOG
 # ==========================================
 elif page == "📋 Event Log":
-    st.title("📋 Bot Event Log")
+    st.markdown("## 📋 Event Log")
 
     events = run_query(
         """
@@ -894,11 +1188,12 @@ elif page == "📋 Event Log":
         # Color-code event types
         def color_event(val):
             colors = {
-                "START": "background-color: #1b5e20; color: white",
-                "STOP": "background-color: #b71c1c; color: white",
-                "ERROR": "background-color: #e65100; color: white",
-                "KILL_SWITCH": "background-color: #880e4f; color: white",
-                "CONFIG_CHANGE": "background-color: #0d47a1; color: white",
+                "START": "background-color: #166534; color: #86efac",
+                "STOP": "background-color: #991b1b; color: #fca5a5",
+                "ERROR": "background-color: #9a3412; color: #fdba74",
+                "KILL_SWITCH": "background-color: #9f1239; color: #fda4af",
+                "CONFIG_CHANGE": "background-color: #1e3a5f; color: #93c5fd",
+                "RESTART": "background-color: #854d0e; color: #fde68a",
             }
             return colors.get(val, "")
 
@@ -908,18 +1203,18 @@ elif page == "📋 Event Log":
             height=600,
         )
     else:
-        st.info("ยังไม่มี Event")
+        st.info("No events yet")
 
 
 # ==========================================
 # PAGE: API USAGE
 # ==========================================
 elif page == "🔑 API Usage":
-    st.title("🔑 AI API Usage Monitor")
+    st.markdown("## 🔑 AI API Usage Monitor")
 
     # --- Period Selector ---
     api_period = st.radio(
-        "ช่วงเวลา",
+        "Period",
         ["Today", "Last 7 Days", "Last 30 Days", "All Time"],
         horizontal=True,
         key="api_period",
@@ -974,7 +1269,7 @@ elif page == "🔑 API Usage":
         lc2.metric("Max Latency", f"{int(s['max_latency_ms']):,} ms")
         lc3.metric("Last Call", s["last_call"].strftime("%Y-%m-%d %H:%M") if s["last_call"] else "N/A")
     else:
-        st.info("ยังไม่มีข้อมูล API Usage ในช่วงเวลานี้")
+        st.info("No API usage data in this period")
 
     st.divider()
 
@@ -1123,7 +1418,7 @@ elif page == "🔑 API Usage":
             fig_lat.update_layout(template="plotly_dark", height=350, xaxis_title="Date", yaxis_title="Latency (ms)")
             st.plotly_chart(fig_lat, use_container_width=True)
     else:
-        st.info("ยังไม่มีข้อมูล Daily API Usage")
+        st.info("No daily API usage data")
 
     st.divider()
 
@@ -1157,13 +1452,13 @@ elif page == "🔑 API Usage":
         )
         st.plotly_chart(fig_hourly, use_container_width=True)
     else:
-        st.info("ยังไม่มีข้อมูลวันนี้")
+        st.info("No data for today")
 
     st.divider()
 
     # --- Recent API Calls (Raw Log) ---
     st.subheader("📝 Recent API Calls")
-    recent_limit = st.number_input("จำนวนแถว", 10, 500, 50, key="api_log_limit")
+    recent_limit = st.number_input("Rows", 10, 500, 50, key="api_log_limit")
     recent_api = run_query(
         """
         SELECT id, provider, model, prompt_tokens, completion_tokens,
@@ -1195,11 +1490,22 @@ elif page == "🔑 API Usage":
         csv_api = df_recent.to_csv(index=False).encode("utf-8")
         st.download_button("📥 Export API Usage CSV", csv_api, "api_usage.csv", "text/csv")
     else:
-        st.info("ยังไม่มี API calls")
+        st.info("No API calls yet")
 
 
 # ==========================================
-# FOOTER
+# SIDEBAR FOOTER
 # ==========================================
 st.sidebar.divider()
-st.sidebar.caption(f"AI Trader Dashboard v2.0 • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+# Show AI provider info
+ai_provider = os.getenv("AI_PROVIDER", "openrouter").lower()
+ai_model = os.getenv("MODEL", os.getenv("NVIDIA_MODEL", "N/A"))
+st.sidebar.markdown(f"""
+<div class="text-muted">
+<b class="gold-accent">Engine:</b> {ai_model}<br>
+<b class="gold-accent">Symbol:</b> XAUUSD<br>
+<b class="gold-accent">Provider:</b> {ai_provider.title()}
+</div>
+""", unsafe_allow_html=True)
+st.sidebar.caption(f"AI Gold Trader v2.0 Enterprise • {datetime.now().strftime('%Y-%m-%d %H:%M')}")

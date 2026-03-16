@@ -1067,9 +1067,23 @@ def sync_closed_trades():
         deals = data.get("deals", [])
 
         if deals:
+            # Pair IN and OUT deals by position_id
+            in_deals = {}   # position_id → deal (open)
+            out_deals = {}  # position_id → deal (close)
+            for deal in deals:
+                pos_id = deal.get("position", deal["order"])
+                if deal.get("entry") == "IN":
+                    in_deals[pos_id] = deal
+                elif deal.get("entry") in ("OUT", "INOUT"):
+                    out_deals[pos_id] = deal
+
             conn = get_db_connection()
             cur = conn.cursor()
-            for deal in deals:
+            updated = 0
+            for pos_id, out_deal in out_deals.items():
+                in_deal = in_deals.get(pos_id)
+                # DB stores opening order as order_id
+                db_order_id = in_deal["order"] if in_deal else pos_id
                 cur.execute(
                     """
                     UPDATE trades
@@ -1077,16 +1091,18 @@ def sync_closed_trades():
                         profit = %s,
                         status = 'CLOSED',
                         closed_at = to_timestamp(%s)
-                    WHERE order_id = %s AND status = 'OPEN';
+                    WHERE order_id = %s AND (status = 'OPEN' OR close_price IS NULL);
                     """,
-                    (deal["price"], deal["profit"], deal["time"], deal["order"]),
+                    (out_deal["price"], out_deal["profit"],
+                     out_deal["time"], db_order_id),
                 )
+                if cur.rowcount > 0:
+                    updated += 1
             conn.commit()
-            updated = sum(1 for d in deals)
             cur.close()
             conn.close()
             if updated:
-                print(f"[SYNC] 🔄 ซิงค์ {len(deals)} closed deals จาก MT5")
+                print(f"[SYNC] 🔄 อัปเดต {updated} closed trades จาก MT5")
     except Exception as e:
         print(f"[SYNC] ⚠️ sync closed deals error: {e}")
 
@@ -1129,11 +1145,30 @@ def sync_closed_trades():
 POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 10))   # วินาที
 MIN_HOLD_SEC = int(os.getenv("MIN_HOLD_SEC", 180))    # 3 นาที
 MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", 600))    # 10 นาที
-MIN_PROFIT_TO_CLOSE = float(os.getenv("MIN_PROFIT_TO_CLOSE", 0.50))  # $0.50 ขั้นต่ำ
-BREAKEVEN_PROFIT_USD = float(os.getenv("BREAKEVEN_PROFIT_USD", 1.00))  # ย้าย SL เป็น breakeven เมื่อกำไร $1+
-TRAILING_STEP_PRICE = float(os.getenv("TRAILING_STEP_PRICE", 1.0))   # ขยับ trailing stop ทุก $1 ราคาทอง
+TRAILING_STEP_PRICE = float(os.getenv("TRAILING_STEP_PRICE", 1.0))   # trailing stop gap (gold price $)
+TRAILING_PROTECT_PCT = float(os.getenv("TRAILING_PROTECT_PCT", 50))  # ป้องกันกำไร % ของ profit distance
+PROFIT_LOCK_PCT = float(os.getenv("PROFIT_LOCK_PCT", 5.0))  # Auto-close เมื่อกำไรถึง % ของ balance (0=disabled)
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", 0.1))  # ย้าย SL เป็น breakeven เมื่อกำไร >= % ของ balance
+MIN_PROFIT_CLOSE_PCT = float(os.getenv("MIN_PROFIT_CLOSE_PCT", 0.05))  # กำไรขั้นต่ำ % ของ balance เพื่อ trigger smart-close
 _forecast_cooldown: dict = {}  # ticket → last_forecast_ts (rate limit AI calls)
 AI_FORECAST_COOLDOWN = int(os.getenv("AI_FORECAST_COOLDOWN", 30))  # เรียก AI ไม่บ่อยกว่า 30 วินาที/position
+_cached_balance: float | None = None
+_cached_balance_ts: float = 0
+
+
+def _get_account_balance() -> float:
+    """ดึง balance จาก MT5 (cached 60s) พร้อม fallback จาก .env"""
+    global _cached_balance, _cached_balance_ts
+    import time as _t
+    now = _t.time()
+    if _cached_balance is not None and now - _cached_balance_ts < 60:
+        return _cached_balance
+    live = _get_live_balance()
+    if live is not None:
+        _cached_balance = live
+        _cached_balance_ts = now
+        return live
+    return float(os.getenv("ACCOUNT_BALANCE", 1000.0))
 
 
 def close_position_mt5(ticket: int) -> dict | None:
@@ -1290,6 +1325,12 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
         now_ts = int(datetime.now(timezone.utc).timestamp())
 
+        # คำนวณ dynamic thresholds จาก actual balance
+        balance = _get_account_balance()
+        profit_lock_usd = balance * (PROFIT_LOCK_PCT / 100) if PROFIT_LOCK_PCT > 0 else 0
+        breakeven_usd = balance * (BREAKEVEN_TRIGGER_PCT / 100)
+        min_profit_close = balance * (MIN_PROFIT_CLOSE_PCT / 100)
+
         for pos in positions:
             ticket = pos["ticket"]
             profit = pos["profit"]
@@ -1300,28 +1341,49 @@ def smart_position_monitor(scalp_tf: str = "M15"):
             current_sl = pos["sl"]
             hold_sec = now_ts - open_time
 
-            # ---- Breakeven: ย้าย SL ไป entry price (+0.10 buffer) ----
-            if profit >= BREAKEVEN_PROFIT_USD and current_sl != 0:
-                breakeven_sl = round(open_price + (0.10 if pos_type == "BUY" else -0.10), 2)
-                if pos_type == "BUY" and current_sl < breakeven_sl:
-                    print(f"[BREAKEVEN] 🔒 #{ticket} profit=${profit:.2f} → SL to breakeven {breakeven_sl}")
-                    modify_sl_mt5(ticket, breakeven_sl)
-                elif pos_type == "SELL" and current_sl > breakeven_sl:
-                    print(f"[BREAKEVEN] 🔒 #{ticket} profit=${profit:.2f} → SL to breakeven {breakeven_sl}")
-                    modify_sl_mt5(ticket, breakeven_sl)
+            # ---- Profit Lock: ปิดทันทีเมื่อกำไรถึง % ของ balance ----
+            if profit_lock_usd > 0 and profit >= profit_lock_usd:
+                print(
+                    f"[SMART] 💰💰 #{ticket} profit=${profit:.2f} >= "
+                    f"${profit_lock_usd:.2f} ({PROFIT_LOCK_PCT}% of ${balance:,.0f}) → AUTO CLOSE"
+                )
+                close_position_mt5(ticket)
+                log_event("PROFIT_LOCK", f"#{ticket} closed at ${profit:.2f} ({PROFIT_LOCK_PCT}% of ${balance:,.0f})")
+                continue
 
-            # ---- Trailing Stop: ขยับ SL ตามกำไร ----
-            if profit >= BREAKEVEN_PROFIT_USD * 2 and current_sl != 0:
+            # ---- Trailing Stop (dynamic gap) ----
+            if profit >= breakeven_usd and current_sl != 0:
                 if pos_type == "BUY":
-                    ideal_sl = round(current_price - TRAILING_STEP_PRICE * 2, 2)
-                    if ideal_sl > current_sl and ideal_sl > open_price:
-                        print(f"[TRAIL] 📈 #{ticket} trailing SL {current_sl} → {ideal_sl}")
-                        modify_sl_mt5(ticket, ideal_sl)
+                    distance = current_price - open_price
+                    if distance > 0:
+                        # gap = min of (fixed step * 2) and (protect_pct of distance)
+                        protect_gap = distance * (1 - TRAILING_PROTECT_PCT / 100)
+                        trailing_gap = min(TRAILING_STEP_PRICE * 2, max(0.30, protect_gap))
+                        ideal_sl = round(current_price - trailing_gap, 2)
+                        # SL ต้องดีกว่าเดิม และ lock profit (above entry)
+                        if ideal_sl > current_sl and ideal_sl > open_price:
+                            print(f"[TRAIL] 📈 #{ticket} profit=${profit:.2f} | SL {current_sl} → {ideal_sl} (gap={trailing_gap:.2f})")
+                            modify_sl_mt5(ticket, ideal_sl)
+                        elif current_sl < open_price:
+                            # SL ยังต่ำกว่า entry → ย้ายไป breakeven อย่างน้อย
+                            breakeven_sl = round(open_price + 0.10, 2)
+                            if current_sl < breakeven_sl:
+                                print(f"[BREAKEVEN] 🔒 #{ticket} profit=${profit:.2f} → SL to breakeven {breakeven_sl}")
+                                modify_sl_mt5(ticket, breakeven_sl)
                 elif pos_type == "SELL":
-                    ideal_sl = round(current_price + TRAILING_STEP_PRICE * 2, 2)
-                    if ideal_sl < current_sl and ideal_sl < open_price:
-                        print(f"[TRAIL] 📉 #{ticket} trailing SL {current_sl} → {ideal_sl}")
-                        modify_sl_mt5(ticket, ideal_sl)
+                    distance = open_price - current_price
+                    if distance > 0:
+                        protect_gap = distance * (1 - TRAILING_PROTECT_PCT / 100)
+                        trailing_gap = min(TRAILING_STEP_PRICE * 2, max(0.30, protect_gap))
+                        ideal_sl = round(current_price + trailing_gap, 2)
+                        if ideal_sl < current_sl and ideal_sl < open_price:
+                            print(f"[TRAIL] 📉 #{ticket} profit=${profit:.2f} | SL {current_sl} → {ideal_sl} (gap={trailing_gap:.2f})")
+                            modify_sl_mt5(ticket, ideal_sl)
+                        elif current_sl > open_price:
+                            breakeven_sl = round(open_price - 0.10, 2)
+                            if current_sl > breakeven_sl:
+                                print(f"[BREAKEVEN] 🔒 #{ticket} profit=${profit:.2f} → SL to breakeven {breakeven_sl}")
+                                modify_sl_mt5(ticket, breakeven_sl)
 
             # ยังไม่ถึงเวลาตรวจ time-based rules
             if hold_sec < MIN_HOLD_SEC:
@@ -1358,8 +1420,8 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     close_position_mt5(ticket)
                 continue
 
-            # ---- กรณี 3: ได้กำไร > min profit, เปิด > MIN_HOLD → AI forecast (rate-limited) ----
-            if profit >= MIN_PROFIT_TO_CLOSE and hold_sec >= MIN_HOLD_SEC:
+            # ---- กรณี 3: ได้กำไร > min profit %, เปิด > MIN_HOLD → AI forecast (rate-limited) ----
+            if profit >= min_profit_close and hold_sec >= MIN_HOLD_SEC:
                 last_call = _forecast_cooldown.get(ticket, 0)
                 if now_ts - last_call < AI_FORECAST_COOLDOWN:
                     continue
