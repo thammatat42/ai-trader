@@ -45,11 +45,12 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     max_trades_per_day  INTEGER   NOT NULL DEFAULT 10,
     pause_max_retries   INTEGER   NOT NULL DEFAULT 5,     -- จำนวนครั้ง retry ขณะ BREAKPOINT (0 = retry ไม่จำกัด)
     pause_retry_sec     INTEGER   NOT NULL DEFAULT 10,    -- เวลา (วินาที) ระหว่าง retry ขณะ BREAKPOINT
+    scalp_timeframe     VARCHAR(10) NOT NULL DEFAULT 'M15',  -- M1/M5/M15/M30
     updated_at          TIMESTAMP DEFAULT NOW()
 );
 
-INSERT INTO bot_settings (is_running, interval_seconds, max_trades_per_day, pause_max_retries, pause_retry_sec)
-SELECT TRUE, 300, 10, 5, 10
+INSERT INTO bot_settings (is_running, interval_seconds, max_trades_per_day, pause_max_retries, pause_retry_sec, scalp_timeframe)
+SELECT TRUE, 300, 10, 5, 10, 'M15'
 WHERE NOT EXISTS (SELECT 1 FROM bot_settings);
 
 -- ==========================================

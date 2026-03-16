@@ -122,26 +122,44 @@ def _get_live_balance() -> float | None:
         return None
 
 
-def calculate_lot_size() -> dict:
-    """คำนวณ Lot Size, SL, TP  →  return dict พร้อมใช้"""
-    # ดึง balance จริงจาก MT5 ก่อน, fallback เป็นค่าใน .env
+def calculate_lot_size(atr_value: float | None = None) -> dict:
+    """คำนวณ Lot Size, SL, TP แบบ Dynamic ตาม ATR"""
     live_balance = _get_live_balance()
     env_balance = float(os.getenv("ACCOUNT_BALANCE", 1000.0))
     balance = live_balance if live_balance is not None else env_balance
     balance_src = "MT5" if live_balance is not None else ".env"
 
     risk_pct = float(os.getenv("RISK_PERCENT", 1.0))
-    sl_points = float(os.getenv("SL_POINTS", 300))
-    tp_points = float(os.getenv("TP_POINTS", 600))   # TP default = 2x SL (Risk:Reward 1:2)
+    default_sl = float(os.getenv("SL_POINTS", 300))
+    default_tp = float(os.getenv("TP_POINTS", 600))
+    atr_sl_multiplier = float(os.getenv("ATR_SL_MULTIPLIER", 1.5))
+    atr_tp_multiplier = float(os.getenv("ATR_TP_MULTIPLIER", 2.5))
+    min_sl = float(os.getenv("MIN_SL_POINTS", 100))
+    max_sl = float(os.getenv("MAX_SL_POINTS", 500))
+
+    # ATR-based dynamic SL/TP (pro trader approach)
+    if atr_value and atr_value > 0:
+        # ATR คือราคาจริง (e.g. 5.50) → แปลงเป็น points (*100)
+        atr_points = atr_value * 100
+        sl_points = round(atr_points * atr_sl_multiplier)
+        tp_points = round(atr_points * atr_tp_multiplier)
+        # Clamp SL within safe range
+        sl_points = max(min_sl, min(max_sl, sl_points))
+        tp_points = max(sl_points * 1.5, tp_points)  # TP ต้อง >= 1.5x SL เสมอ
+        sl_src = "ATR"
+    else:
+        sl_points = default_sl
+        tp_points = default_tp
+        sl_src = "fixed"
 
     risk_amount = balance * (risk_pct / 100)
     lot_size = risk_amount / sl_points
     final_lot = max(0.01, round(lot_size, 2))
 
     print(
-        f"[INFO] ทุน ${balance:,.2f} ({balance_src}) | เสี่ยง {risk_pct}% (${risk_amount:,.2f}) "
-        f"| SL {sl_points} จุด | TP {tp_points} จุด | R:R 1:{tp_points/sl_points:.1f} "
-        f"-> ใช้ Lot: {final_lot}"
+        f"[RISK] ทุน ${balance:,.2f} ({balance_src}) | เสี่ยง {risk_pct}% (${risk_amount:,.2f}) "
+        f"| SL {sl_points} ({sl_src}) | TP {tp_points} | R:R 1:{tp_points/sl_points:.1f} "
+        f"-> Lot: {final_lot}"
     )
     return {"lot_size": final_lot, "sl_points": sl_points, "tp_points": tp_points}
 
@@ -243,6 +261,64 @@ def calc_atr(candles: list, period: int = 14) -> float | None:
     return round(atr, 2)
 
 
+def calc_macd(closes: list, fast: int = 12, slow: int = 26, signal_period: int = 9) -> dict | None:
+    """MACD (Moving Average Convergence Divergence)"""
+    if len(closes) < slow + signal_period:
+        return None
+    ema_fast = calc_ema(closes, fast)
+    ema_slow = calc_ema(closes, slow)
+    if ema_fast is None or ema_slow is None:
+        return None
+
+    # คำนวณ MACD line ทั้ง series เพื่อหา signal line
+    macd_vals = []
+    for i in range(slow, len(closes) + 1):
+        ef = calc_ema(closes[:i], fast)
+        es = calc_ema(closes[:i], slow)
+        if ef is not None and es is not None:
+            macd_vals.append(ef - es)
+
+    if len(macd_vals) < signal_period:
+        return None
+
+    # Signal line = EMA of MACD values
+    multiplier = 2 / (signal_period + 1)
+    sig = sum(macd_vals[:signal_period]) / signal_period
+    for v in macd_vals[signal_period:]:
+        sig = (v - sig) * multiplier + sig
+
+    macd_line = macd_vals[-1]
+    histogram = macd_line - sig
+
+    return {
+        "macd": round(macd_line, 3),
+        "signal": round(sig, 3),
+        "histogram": round(histogram, 3),
+        "cross": "bullish" if macd_line > sig else "bearish",
+    }
+
+
+def calc_bollinger(closes: list, period: int = 20, std_dev: float = 2.0) -> dict | None:
+    """Bollinger Bands"""
+    if len(closes) < period:
+        return None
+    sma = sum(closes[-period:]) / period
+    variance = sum((c - sma) ** 2 for c in closes[-period:]) / period
+    std = variance ** 0.5
+    upper = sma + std_dev * std
+    lower = sma - std_dev * std
+    current = closes[-1]
+    # %B = (price - lower) / (upper - lower)
+    pct_b = (current - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+    return {
+        "upper": round(upper, 2),
+        "middle": round(sma, 2),
+        "lower": round(lower, 2),
+        "pct_b": round(pct_b, 3),  # 0=lower band, 1=upper band
+        "bandwidth": round((upper - lower) / sma * 100, 3),  # volatility %
+    }
+
+
 def calc_support_resistance(candles: list, lookback: int = 20) -> dict:
     """Simple support/resistance from recent highs and lows"""
     recent = candles[-lookback:] if len(candles) >= lookback else candles
@@ -254,13 +330,16 @@ def calc_support_resistance(candles: list, lookback: int = 20) -> dict:
     }
 
 
-def build_technical_summary(candles_h1: list, candles_h4: list, candles_d1: list) -> str:
+def build_technical_summary(candles_h1: list, candles_h4: list, candles_d1: list,
+                           candles_scalp: list = None, scalp_tf: str = "M5") -> str:
     """สร้างสรุป Technical Indicators เพื่อส่งให้ AI"""
     lines = []
 
-    for label, candles in [("H1", candles_h1), ("H4", candles_h4), ("D1", candles_d1)]:
+    tf_list = [(scalp_tf, candles_scalp), ("H1", candles_h1), ("H4", candles_h4), ("D1", candles_d1)]
+    for label, candles in tf_list:
         if not candles or len(candles) < 20:
-            lines.append(f"[{label}] Insufficient data")
+            if candles is not None:  # None = not requested
+                lines.append(f"[{label}] Insufficient data")
             continue
 
         closes = [c["close"] for c in candles]
@@ -272,6 +351,8 @@ def build_technical_summary(candles_h1: list, candles_h4: list, candles_d1: list
         rsi = calc_rsi(closes, 14)
         atr = calc_atr(candles, 14)
         sr = calc_support_resistance(candles, 20)
+        macd = calc_macd(closes)
+        bb = calc_bollinger(closes)
 
         # Trend detection
         trend = "Sideways"
@@ -289,12 +370,24 @@ def build_technical_summary(candles_h1: list, candles_h4: list, candles_d1: list
             direction = "Bull" if body > 0 else "Bear"
             candle_summary += f"{direction}({abs(body):.1f}) "
 
-        lines.append(
-            f"[{label}] Close={current:.2f} | EMA9={ema_9:.2f} EMA21={ema_21:.2f} SMA20={sma_20:.2f} | "
-            f"RSI={rsi} | ATR={atr} | Trend={trend} | "
-            f"Support={sr['support']} Resist={sr['resistance']} | "
-            f"Last5: {candle_summary.strip()}"
-        )
+        # Build line
+        parts = [
+            f"[{label}] Close={current:.2f}",
+            f"EMA9={ema_9:.2f} EMA21={ema_21:.2f} SMA20={sma_20:.2f}",
+            f"RSI={rsi}",
+            f"ATR={atr}",
+        ]
+        if macd:
+            parts.append(f"MACD={macd['macd']} Sig={macd['signal']} Hist={macd['histogram']} ({macd['cross']})")
+        if bb:
+            parts.append(f"BB%B={bb['pct_b']} Upper={bb['upper']} Lower={bb['lower']} BW={bb['bandwidth']}%")
+        parts.extend([
+            f"Trend={trend}",
+            f"Support={sr['support']} Resist={sr['resistance']}",
+            f"Last5: {candle_summary.strip()}",
+        ])
+
+        lines.append(" | ".join(parts))
 
     return "\n".join(lines)
 
@@ -382,9 +475,13 @@ def fetch_economic_calendar() -> list[dict]:
 
         resp = http_session.get(
             FINNHUB_CALENDAR_URL,
-            params={"from": today, "to": tomorrow, "token": api_key},
+            params={"from": today, "to": tomorrow},
+            headers={"X-Finnhub-Token": api_key},
             timeout=10,
         )
+        if resp.status_code == 403:
+            print("[WARN] Finnhub calendar: 403 Forbidden – API key อาจหมดอายุหรือ endpoint นี้ต้อง Premium plan")
+            return []
         resp.raise_for_status()
         data = resp.json()
         events = data.get("economicCalendar", [])
@@ -440,9 +537,13 @@ def fetch_market_news() -> list[dict]:
     try:
         resp = http_session.get(
             FINNHUB_NEWS_URL,
-            params={"category": "forex", "token": api_key},
+            params={"category": "forex"},
+            headers={"X-Finnhub-Token": api_key},
             timeout=10,
         )
+        if resp.status_code == 403:
+            print("[WARN] Finnhub news: 403 Forbidden – API key อาจหมดอายุหรือ endpoint นี้ต้อง Premium plan")
+            return []
         resp.raise_for_status()
         articles = resp.json()
 
@@ -613,19 +714,48 @@ def journal_detect_patterns():
 # ==========================================
 # 2.5  PARSE AI SENTIMENT
 # ==========================================
+def _extract_confidence(ai_text: str) -> int:
+    """ดึงค่า Confidence (1-10) จากข้อความ AI"""
+    import re
+    match = re.search(r'confidence[:\s]*([0-9]{1,2})', ai_text.lower())
+    if match:
+        val = int(match.group(1))
+        return min(val, 10)
+    return 0
+
+
 def parse_sentiment(ai_text: str) -> str:
     """
     แยก Sentiment จากข้อความ AI → return 'BUY' / 'SELL' / 'WAIT'
-    Bullish  → BUY
-    Bearish  → SELL
-    Neutral / Unknown → WAIT
+    - Bullish → BUY (confidence ≥ 5)
+    - Bearish → SELL (confidence ≥ 5)
+    - SELL with keyword if AI says SELL explicitly
+    - BUY with keyword if AI says BUY explicitly
+    - Neutral → WAIT
     """
     text_lower = ai_text.lower()
+    confidence = _extract_confidence(ai_text)
+    min_confidence = int(os.getenv("MIN_CONFIDENCE", 5))
+
+    # ดึง sentiment จาก AI response
+    sentiment = "WAIT"
     if "bullish" in text_lower:
-        return "BUY"
+        sentiment = "BUY"
     elif "bearish" in text_lower:
-        return "SELL"
-    return "WAIT"
+        sentiment = "SELL"
+
+    # ถ้า AI เขียน action ตรงๆ เช่น "Action: BUY" หรือ "→ SELL"
+    import re
+    action_match = re.search(r'(?:action|signal|recommendation)[:\s]*(buy|sell)', text_lower)
+    if action_match:
+        sentiment = action_match.group(1).upper()
+
+    # เช็ค confidence threshold
+    if sentiment in ("BUY", "SELL") and confidence < min_confidence:
+        print(f"[DECISION] ⚠️ AI says {sentiment} but confidence {confidence} < {min_confidence} → WAIT")
+        return "WAIT"
+
+    return sentiment
 
 
 # ==========================================
@@ -701,7 +831,8 @@ def _get_ai_config() -> dict:
 
 def analyze_with_ai(price_data, technical_summary: str = "",
                     orderbook_summary: str = "", news_summary: str = "",
-                    journal_history: str = "", journal_knowledge: str = "") -> str:
+                    journal_history: str = "", journal_knowledge: str = "",
+                    scalp_tf: str = "M5") -> str:
     ai_cfg = _get_ai_config()
     api_key = ai_cfg["api_key"]
     url = ai_cfg["url"]
@@ -714,29 +845,38 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         print(f"[ERROR] ไม่พบ API Key สำหรับ provider '{ai_cfg['provider']}' ใน .env")
         return "ERROR"
 
+    stf = scalp_tf  # short alias for string interpolation
     system_prompt = (
-        "You are a professional XAUUSD (Gold) technical analyst with 15+ years of experience. "
-        "You analyze multi-timeframe data (H1, H4, D1) using EMA crossovers, RSI, ATR, "
-        "support/resistance levels, candlestick patterns, order flow, and macro events "
-        "to make trading decisions.\n\n"
-        "DATA AVAILABLE:\n"
-        "1. Multi-timeframe technical indicators (H1, H4, D1)\n"
-        "2. Order book / depth of market (buy/sell pressure)\n"
-        "3. Economic calendar & macro news (Fed, CPI, NFP, geopolitical)\n"
-        "4. Your previous analysis history (for consistency & pattern tracking)\n\n"
-        "DECISION RULES:\n"
-        "- BUY (Bullish): EMA9 > EMA21 on H1+H4, RSI 30-65, price above support, "
-        "uptrend on higher TF, no upcoming high-impact bearish news, buyers dominate order book\n"
-        "- SELL (Bearish): EMA9 < EMA21 on H1+H4, RSI 35-70, price below resistance, "
-        "downtrend on higher TF, no upcoming high-impact bullish news, sellers dominate order book\n"
-        "- WAIT (Neutral): Conflicting signals across TFs, RSI overbought >70 or oversold <30 "
-        "without confirmation, high-impact news pending within 1 hour, extreme ATR spike, "
-        "price squeezed near S/R\n\n"
-        "NEWS IMPACT RULES:\n"
-        "- If high-impact US economic data (CPI, NFP, FOMC) is pending within 1 hour → WAIT\n"
-        "- If data just released with surprise → factor direction into decision\n"
-        "- Geopolitical risk escalation → Gold bullish bias\n\n"
-        "CONFIDENCE: Rate 1-10 based on signal alignment across all data sources.\n\n"
+        "You are a professional XAUUSD (Gold) short-term scalp/swing trader with 15+ years experience. "
+        f"You analyze multi-timeframe data ({stf}, H1, H4, D1) using EMA crossovers, RSI, MACD, "
+        "Bollinger Bands, ATR, support/resistance, candlestick patterns, order flow, and macro events.\n\n"
+        "TRADING STYLE: Short-term scalping & quick swing trades (3-15 min hold time). "
+        "You are DECISIVE — you look for opportunities, not reasons to stay out.\n\n"
+        "DECISION RULES (need 3+ signals aligned, NOT all):\n"
+        "- BUY (Bullish): At least 3 of: EMA9>EMA21 on H1 OR H4, RSI 30-60, "
+        "MACD histogram positive or bullish crossover, price near/below lower Bollinger Band (BB%B<0.3), "
+        f"price bouncing off support, bullish candle pattern on {stf}/H1, "
+        "geopolitical risk rising, buyers stronger in order book\n"
+        "- SELL (Bearish): At least 3 of: EMA9<EMA21 on H1 OR H4, RSI 40-70, "
+        "MACD histogram negative or bearish crossover, price near/above upper Bollinger Band (BB%B>0.7), "
+        f"price rejected at resistance, bearish candle pattern on {stf}/H1, "
+        "USD strengthening, sellers stronger in order book\n"
+        "- WAIT (Neutral): ONLY when fewer than 2 signals align, "
+        "RSI extreme (>75 or <25) without reversal confirmation, "
+        "OR high-impact news (CPI/NFP/FOMC) pending within 30 minutes\n\n"
+        f"{stf} SCALP RULES (use {stf} data for entry timing):\n"
+        f"- If H1 trend is clear but {stf} shows pullback → good entry (trade WITH H1 trend)\n"
+        f"- If {stf} RSI is oversold (<30) in an H1 uptrend → strong BUY signal\n"
+        f"- If {stf} RSI is overbought (>70) in an H1 downtrend → strong SELL signal\n"
+        f"- If {stf} MACD just crossed bullish/bearish → confirms entry direction\n\n"
+        "IMPORTANT: If order book data is not available, IGNORE it — do NOT treat missing DOM as negative signal.\n\n"
+        "BIAS RULES:\n"
+        "- Geopolitical tension/war/sanctions → Gold bullish bias (lean BUY)\n"
+        "- When H1 and H4 agree on direction → take the trade even if D1 is sideways\n"
+        "- When recent candles show strong momentum in one direction → follow momentum\n"
+        f"- Sideways D1 does NOT mean WAIT — use H1/{stf} for short-term scalps\n"
+        "- Bollinger Band squeeze (low bandwidth) → expect breakout soon, prepare to trade the break\n\n"
+        "CONFIDENCE: Rate 1-10. If confidence ≥ 5 with directional lean, declare Bullish or Bearish.\n\n"
         "Reply EXACTLY in this format (no extra text):\n"
         "Sentiment: <Bullish/Bearish/Neutral>\n"
         "Confidence: <1-10>\n"
@@ -977,6 +1117,300 @@ def sync_closed_trades():
 
 
 def log_event(event_type: str, message: str):
+
+
+# ==========================================
+# 4.6  SMART POSITION MANAGER
+# ==========================================
+# ตรวจ position ที่เปิดอยู่ → ปิดอัตโนมัติถ้า:
+#   - เปิดนาน > MIN_HOLD_SEC และได้กำไร แต่ไม่ถึง TP
+#   - AI วิเคราะห์ M5 แล้วเห็น reversal signs
+#   - เปิดนาน > MAX_HOLD_SEC → ปิดทุกกรณีถ้ายังกำไร
+#   - Trailing stop: ขยับ SL ตามราคาเมื่อกำไร
+#   - Breakeven: ย้าย SL ไป entry price เมื่อกำไรถึง threshold
+# ==========================================
+POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 10))   # วินาที
+MIN_HOLD_SEC = int(os.getenv("MIN_HOLD_SEC", 180))    # 3 นาที
+MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", 600))    # 10 นาที
+MIN_PROFIT_TO_CLOSE = float(os.getenv("MIN_PROFIT_TO_CLOSE", 0.50))  # $0.50 ขั้นต่ำ
+BREAKEVEN_PROFIT_USD = float(os.getenv("BREAKEVEN_PROFIT_USD", 1.00))  # ย้าย SL เป็น breakeven เมื่อกำไร $1+
+TRAILING_STEP_PRICE = float(os.getenv("TRAILING_STEP_PRICE", 1.0))   # ขยับ trailing stop ทุก $1 ราคาทอง
+_forecast_cooldown: dict = {}  # ticket → last_forecast_ts (rate limit AI calls)
+AI_FORECAST_COOLDOWN = int(os.getenv("AI_FORECAST_COOLDOWN", 30))  # เรียก AI ไม่บ่อยกว่า 30 วินาที/position
+
+
+def close_position_mt5(ticket: int) -> dict | None:
+    """ส่งคำสั่งปิด position ผ่าน Windows VPS"""
+    windows_ip = os.getenv("WINDOWS_IP")
+    url = f"http://{windows_ip}:8000/close"
+    try:
+        resp = http_session.post(url, json={"ticket": ticket}, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("success"):
+            print(f"[SMART-CLOSE] ✅ ปิด Position #{ticket} สำเร็จ | Profit: ${result.get('profit', 0):.2f}")
+            log_event("SMART_CLOSE", f"Closed #{ticket} profit=${result.get('profit', 0):.2f}")
+        else:
+            print(f"[SMART-CLOSE] ❌ ปิดไม่สำเร็จ #{ticket}: {result.get('error')}")
+        return result
+    except Exception as e:
+        print(f"[SMART-CLOSE] ❌ Error closing #{ticket}: {e}")
+        return None
+
+
+def modify_sl_mt5(ticket: int, new_sl: float, new_tp: float = None) -> bool:
+    """ส่งคำสั่งแก้ไข SL/TP ผ่าน Windows VPS (trailing stop / breakeven)"""
+    windows_ip = os.getenv("WINDOWS_IP")
+    url = f"http://{windows_ip}:8000/modify_sl"
+    payload = {"ticket": ticket, "sl": new_sl}
+    if new_tp is not None:
+        payload["tp"] = new_tp
+    try:
+        resp = http_session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("success"):
+            print(f"[TRAIL] 📐 SL updated #{ticket} → SL={new_sl}")
+            return True
+        else:
+            print(f"[TRAIL] ⚠️ Modify failed #{ticket}: {result.get('error')}")
+            return False
+    except Exception as e:
+        print(f"[TRAIL] ❌ Error: {e}")
+        return False
+
+
+def ai_quick_forecast(candles_scalp: list, current_price: float,
+                      position_type: str, profit: float,
+                      scalp_tf: str = "M15") -> dict:
+    """
+    AI วิเคราะห์แบบ lightweight (ใช้ token น้อย) เพื่อ forecast short-term
+    Return: {"action": "CLOSE"/"HOLD", "reason": "..."}
+    """
+    if not candles_scalp or len(candles_scalp) < 10:
+        return {"action": "CLOSE", "reason": f"Insufficient {scalp_tf} data, closing profitable trade"}
+
+    # สร้าง compact summary (ประหยัด token)
+    closes = [c["close"] for c in candles_scalp]
+    last_10 = candles_scalp[-10:]
+
+    ema_5 = calc_ema(closes, 5)
+    ema_10 = calc_ema(closes, 10)
+    rsi = calc_rsi(closes, 14)
+
+    # Quick momentum check (ไม่ต้องเรียก AI ถ้าชัดเจน)
+    if len(closes) >= 3:
+        recent_move = closes[-1] - closes[-3]
+        if position_type == "BUY" and recent_move < -1.0:
+            return {"action": "CLOSE", "reason": f"Price dropping fast ({recent_move:.2f}), protect profit"}
+        if position_type == "SELL" and recent_move > 1.0:
+            return {"action": "CLOSE", "reason": f"Price rising fast (+{recent_move:.2f}), protect profit"}
+
+    # ถ้า momentum ไม่ชัด → ใช้ AI (compact prompt, ~100 tokens)
+    candle_str = " ".join(
+        f"{'U' if c['close']>c['open'] else 'D'}{abs(c['close']-c['open']):.1f}"
+        for c in last_10
+    )
+
+    ai_cfg = _get_ai_config()
+    api_key = ai_cfg["api_key"]
+    if not api_key:
+        return {"action": "HOLD", "reason": "No AI key"}
+
+    compact_prompt = (
+        f"XAUUSD {scalp_tf} last 10 candles (U=up D=down): {candle_str}\n"
+        f"Price={current_price:.2f} EMA5={ema_5:.2f} EMA10={ema_10:.2f} RSI={rsi}\n"
+        f"Open {position_type} trade profit=${profit:.2f}\n"
+        f"Will price go {'up' if position_type == 'BUY' else 'down'} in next 5 min?\n"
+        f"Reply ONLY: HOLD or CLOSE and 5 words max reason."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": ai_cfg["model"],
+        "messages": [{"role": "user", "content": compact_prompt}],
+        "max_tokens": 30,
+        "temperature": 0.0,
+    }
+
+    try:
+        import time as _time
+        t_start = _time.time()
+        resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        resp_json = resp.json()
+        elapsed_ms = int((_time.time() - t_start) * 1000)
+
+        usage = resp_json.get("usage", {})
+        save_api_usage(
+            provider=ai_cfg["provider"],
+            model=ai_cfg["model"],
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            response_time_ms=elapsed_ms,
+            status="OK_FORECAST",
+        )
+
+        reply = resp_json["choices"][0]["message"]["content"].strip().upper()
+        if "CLOSE" in reply:
+            return {"action": "CLOSE", "reason": reply}
+        return {"action": "HOLD", "reason": reply}
+    except Exception as e:
+        print(f"[FORECAST] ⚠️ AI forecast failed: {e}")
+        # Fallback: ถ้า AI เรียกไม่ได้ ใช้ technical rule
+        if ema_5 and ema_10:
+            if position_type == "BUY" and ema_5 < ema_10:
+                return {"action": "CLOSE", "reason": "EMA bearish crossover (fallback)"}
+            if position_type == "SELL" and ema_5 > ema_10:
+                return {"action": "CLOSE", "reason": "EMA bullish crossover (fallback)"}
+        return {"action": "HOLD", "reason": "AI unavailable, hold"}
+
+
+def smart_position_monitor(scalp_tf: str = "M15"):
+    """
+    ตรวจสอบ open positions และจัดการอัตโนมัติ:
+    1. Breakeven: ย้าย SL ไป entry price เมื่อกำไรถึง threshold
+    2. Trailing stop: ขยับ SL ตามกำไรที่เพิ่มขึ้น
+    3. Time-based close: ปิดเมื่อเปิดนานเกินกำหนด
+    4. AI forecast: วิเคราะห์ scalp TF เพื่อตัดสินใจ (rate-limited)
+    """
+    windows_ip = os.getenv("WINDOWS_IP")
+    if not windows_ip:
+        return
+
+    try:
+        resp = http_session.get(f"http://{windows_ip}:8000/positions", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        positions = data.get("positions", [])
+
+        if not positions:
+            return
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+        for pos in positions:
+            ticket = pos["ticket"]
+            profit = pos["profit"]
+            open_time = pos["time"]
+            pos_type = pos["type"]  # "BUY" or "SELL"
+            current_price = pos["current_price"]
+            open_price = pos["open_price"]
+            current_sl = pos["sl"]
+            hold_sec = now_ts - open_time
+
+            # ---- Breakeven: ย้าย SL ไป entry price (+0.10 buffer) ----
+            if profit >= BREAKEVEN_PROFIT_USD and current_sl != 0:
+                breakeven_sl = round(open_price + (0.10 if pos_type == "BUY" else -0.10), 2)
+                if pos_type == "BUY" and current_sl < breakeven_sl:
+                    print(f"[BREAKEVEN] 🔒 #{ticket} profit=${profit:.2f} → SL to breakeven {breakeven_sl}")
+                    modify_sl_mt5(ticket, breakeven_sl)
+                elif pos_type == "SELL" and current_sl > breakeven_sl:
+                    print(f"[BREAKEVEN] 🔒 #{ticket} profit=${profit:.2f} → SL to breakeven {breakeven_sl}")
+                    modify_sl_mt5(ticket, breakeven_sl)
+
+            # ---- Trailing Stop: ขยับ SL ตามกำไร ----
+            if profit >= BREAKEVEN_PROFIT_USD * 2 and current_sl != 0:
+                if pos_type == "BUY":
+                    ideal_sl = round(current_price - TRAILING_STEP_PRICE * 2, 2)
+                    if ideal_sl > current_sl and ideal_sl > open_price:
+                        print(f"[TRAIL] 📈 #{ticket} trailing SL {current_sl} → {ideal_sl}")
+                        modify_sl_mt5(ticket, ideal_sl)
+                elif pos_type == "SELL":
+                    ideal_sl = round(current_price + TRAILING_STEP_PRICE * 2, 2)
+                    if ideal_sl < current_sl and ideal_sl < open_price:
+                        print(f"[TRAIL] 📉 #{ticket} trailing SL {current_sl} → {ideal_sl}")
+                        modify_sl_mt5(ticket, ideal_sl)
+
+            # ยังไม่ถึงเวลาตรวจ time-based rules
+            if hold_sec < MIN_HOLD_SEC:
+                continue
+
+            # ถ้าขาดทุน → ไม่ปิด (ให้ SL จัดการ ยกเว้นเกิน MAX_HOLD_SEC)
+            if profit <= 0 and hold_sec < MAX_HOLD_SEC:
+                continue
+
+            # ---- กรณี 1: เปิดนานเกิน MAX_HOLD แต่ยังได้กำไร → ปิดเลย ----
+            if hold_sec >= MAX_HOLD_SEC and profit > 0:
+                print(
+                    f"[SMART] ⏰ Position #{ticket} open {hold_sec}s > MAX {MAX_HOLD_SEC}s "
+                    f"| Profit ${profit:.2f} → CLOSE"
+                )
+                close_position_mt5(ticket)
+                continue
+
+            # ---- กรณี 2: เปิดนานเกิน MAX_HOLD และขาดทุน → AI ตัดสินใจ (rate-limited) ----
+            if hold_sec >= MAX_HOLD_SEC and profit <= 0:
+                # Rate limit: ไม่เรียก AI บ่อยเกินไป
+                last_call = _forecast_cooldown.get(ticket, 0)
+                if now_ts - last_call < AI_FORECAST_COOLDOWN:
+                    continue
+                _forecast_cooldown[ticket] = now_ts
+
+                candles_scalp = get_candles_from_mt5(scalp_tf, 20)
+                forecast = ai_quick_forecast(candles_scalp, current_price, pos_type, profit, scalp_tf=scalp_tf)
+                print(
+                    f"[SMART] ⏰ Position #{ticket} open {hold_sec}s > MAX, "
+                    f"loss ${profit:.2f} | AI: {forecast['action']} ({forecast['reason']})"
+                )
+                if forecast["action"] == "CLOSE":
+                    close_position_mt5(ticket)
+                continue
+
+            # ---- กรณี 3: ได้กำไร > min profit, เปิด > MIN_HOLD → AI forecast (rate-limited) ----
+            if profit >= MIN_PROFIT_TO_CLOSE and hold_sec >= MIN_HOLD_SEC:
+                last_call = _forecast_cooldown.get(ticket, 0)
+                if now_ts - last_call < AI_FORECAST_COOLDOWN:
+                    continue
+                _forecast_cooldown[ticket] = now_ts
+
+                candles_scalp = get_candles_from_mt5(scalp_tf, 20)
+
+                forecast = ai_quick_forecast(candles_scalp, current_price, pos_type, profit, scalp_tf=scalp_tf)
+                print(
+                    f"[SMART] 💰 Position #{ticket} | {pos_type} | "
+                    f"Hold {hold_sec}s | Profit ${profit:.2f} | "
+                    f"AI: {forecast['action']} ({forecast['reason']})"
+                )
+
+                if forecast["action"] == "CLOSE":
+                    close_position_mt5(ticket)
+
+        # Cleanup cooldown dict for closed positions
+        open_tickets = {p["ticket"] for p in positions}
+        for t in list(_forecast_cooldown.keys()):
+            if t not in open_tickets:
+                del _forecast_cooldown[t]
+
+    except Exception as e:
+        print(f"[SMART] ⚠️ Position monitor error: {e}")
+
+
+def _position_monitor_thread():
+    """Thread ที่รัน smart_position_monitor loop"""
+    print(f"[SMART] 🔄 Position Monitor started (check every {POSITION_CHECK_INTERVAL}s)")
+    log_event("MONITOR_START", f"Smart Position Monitor started (interval={POSITION_CHECK_INTERVAL}s)")
+
+    while not _shutdown:
+        try:
+            # เช็คตลาดก่อน
+            market_open, _ = is_market_open()
+            if market_open:
+                # ดึง scalp_tf จาก DB (dynamic, ไม่ต้อง restart)
+                _, _, _, _, _, scalp_tf = check_bot_status()
+                smart_position_monitor(scalp_tf=scalp_tf)
+        except Exception as e:
+            print(f"[SMART] ⚠️ Monitor thread error: {e}")
+        time.sleep(POSITION_CHECK_INTERVAL)
+
+    print("[SMART] Position Monitor stopped")
+
+
+def log_event(event_type: str, message: str):
     """บันทึกเหตุการณ์สำคัญลง bot_events"""
     try:
         conn = get_db_connection()
@@ -998,7 +1432,7 @@ def log_event(event_type: str, message: str):
 def check_bot_status():
     """
     ถาม Database ว่า Dashboard สั่ง RUN หรือ STOP อยู่
-    Return: (is_running, interval_seconds, pause_max_retries, pause_retry_sec, max_trades_per_day)
+    Return: (is_running, interval_seconds, pause_max_retries, pause_retry_sec, max_trades_per_day, scalp_timeframe)
     """
     try:
         conn = get_db_connection()
@@ -1006,18 +1440,19 @@ def check_bot_status():
         cur.execute(
             "SELECT is_running, interval_seconds, "
             "COALESCE(pause_max_retries, 5), COALESCE(pause_retry_sec, 10), "
-            "COALESCE(max_trades_per_day, 10) "
+            "COALESCE(max_trades_per_day, 10), "
+            "COALESCE(scalp_timeframe, 'M15') "
             "FROM bot_settings LIMIT 1;"
         )
         row = cur.fetchone()
         cur.close()
         conn.close()
         if row:
-            return bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4])
-        return True, 300, 5, 10, 10  # Defaults
+            return bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]), str(row[5])
+        return True, 300, 5, 10, 10, "M15"  # Defaults
     except Exception as e:
         print(f"[ERROR] เช็คสถานะ Bot ล้มเหลว: {e}")
-        return False, 60, 5, 10, 10  # DB พัง -> หยุดเทรดไว้ก่อนเพื่อความปลอดภัย
+        return False, 60, 5, 10, 10, "M15"  # DB พัง -> หยุดเทรดไว้ก่อนเพื่อความปลอดภัย
 
 
 def get_today_trade_count() -> int:
@@ -1043,11 +1478,73 @@ def get_today_trade_count() -> int:
 # ==========================================
 MARKET_CLOSED_CHECK_SEC = 300  # เมื่อตลาดปิด เช็คซ้ำทุก 5 นาที (ลด resource usage)
 CONSECUTIVE_ERR_LIMIT = 5     # ผิดพลาดติดต่อกัน 5 ครั้ง -> หยุดอัตโนมัติ
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", 5.0))  # Max spread allowed (in price)
 
+
+def has_open_position(symbol: str = None) -> dict | None:
+    """เช็คว่ามี position เปิดอยู่แล้วหรือไม่ (ป้องกันเปิดซ้ำ)"""
+    windows_ip = os.getenv("WINDOWS_IP")
+    if not windows_ip:
+        return None
+    try:
+        resp = http_session.get(f"http://{windows_ip}:8000/positions", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        positions = data.get("positions", [])
+        if not positions:
+            return None
+        # ถ้ามี position ของ symbol ที่ต้องการ
+        if symbol:
+            for p in positions:
+                if p["symbol"] == symbol:
+                    return p
+        return positions[0] if positions else None
+    except Exception:
+        return None
+
+
+def get_recent_win_rate(days: int = 3) -> dict:
+    """ดึง Win Rate ย้อนหลังเพื่อปรับ confidence"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE profit > 0) as wins,
+                COUNT(*) FILTER (WHERE profit <= 0) as losses,
+                COUNT(*) as total,
+                COALESCE(SUM(profit), 0) as total_profit
+            FROM trades
+            WHERE status = 'CLOSED'
+              AND closed_at >= NOW() - INTERVAL '%s days';
+            """,
+            (days,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row[2] > 0:
+            return {
+                "wins": row[0], "losses": row[1], "total": row[2],
+                "win_rate": round(row[0] / row[2] * 100, 1),
+                "total_profit": round(float(row[3]), 2),
+            }
+        return {"wins": 0, "losses": 0, "total": 0, "win_rate": 0, "total_profit": 0}
+    except Exception as e:
+        print(f"[WARN] get_recent_win_rate: {e}")
+        return {"wins": 0, "losses": 0, "total": 0, "win_rate": 0, "total_profit": 0}
+
+
+import threading
 
 def main_loop():
     print("🚀 เริ่มระบบ AI Trader Background Service...")
     log_event("START", "AI Trader service started")
+
+    # ---- เริ่ม Smart Position Monitor Thread ----
+    monitor_thread = threading.Thread(target=_position_monitor_thread, daemon=True)
+    monitor_thread.start()
 
     consecutive_errors = 0
     pause_retries = 0             # นับจำนวน retry ขณะ BREAKPOINT
@@ -1065,7 +1562,7 @@ def main_loop():
         _last_market_log = None
 
         # ---- 1. เช็ค Kill Switch / Breakpoint จาก Dashboard ----
-        is_running, interval, max_retries, retry_sec, max_trades = check_bot_status()
+        is_running, interval, max_retries, retry_sec, max_trades, scalp_tf = check_bot_status()
 
         if not is_running:
             pause_retries += 1
@@ -1099,26 +1596,53 @@ def main_loop():
 
             bid = price["bid"]
             ask = price["ask"]
+            spread = round(ask - bid, 2)
             symbol = os.getenv("SYMBOL", "XAUUSD")
-            print(f"[INFO] Bid {bid} / Ask {ask}")
+            print(f"[INFO] Bid {bid} / Ask {ask} / Spread {spread}")
 
-            risk = calculate_lot_size()
-            lot_size  = risk["lot_size"]
-            sl_points = risk["sl_points"]
-            tp_points = risk["tp_points"]
+            # ---- 2.1 Spread filter ----
+            if spread > MAX_SPREAD:
+                print(f"[SPREAD] ⚠️ Spread {spread} > MAX {MAX_SPREAD} → ข้ามรอบนี้ (สภาพตลาดไม่ดี)")
+                time.sleep(30)
+                continue
+
+            # ---- 2.2 Duplicate position guard ----
+            existing_pos = has_open_position(symbol)
+            if existing_pos:
+                print(
+                    f"[GUARD] 🛡️ มี Position เปิดอยู่แล้ว: #{existing_pos['ticket']} "
+                    f"{existing_pos['type']} Lot={existing_pos['lot']} "
+                    f"Profit=${existing_pos['profit']:.2f} → ข้ามการเปิด Order ใหม่"
+                )
+                # ยังคง sync trades
+                sync_closed_trades()
+                time.sleep(min(30, interval))
+                continue
 
             # ---- 3. ดึง Candle data + คำนวณ Technical Indicators ----
-            print("[INFO] ดึง Candle data (H1, H4, D1)...")
+            print(f"[INFO] ดึง Candle data ({scalp_tf}, H1, H4, D1)...")
+            candles_scalp = get_candles_from_mt5(scalp_tf, 30)
             candles_h1 = get_candles_from_mt5("H1", 50)
             candles_h4 = get_candles_from_mt5("H4", 50)
             candles_d1 = get_candles_from_mt5("D1", 30)
 
             tech_summary = ""
+            # คำนวณ ATR จาก H1 สำหรับ dynamic SL/TP
+            h1_atr = None
             if candles_h1 and candles_h4 and candles_d1:
-                tech_summary = build_technical_summary(candles_h1, candles_h4, candles_d1)
+                tech_summary = build_technical_summary(
+                    candles_h1, candles_h4, candles_d1,
+                    candles_scalp=candles_scalp, scalp_tf=scalp_tf,
+                )
+                h1_atr = calc_atr(candles_h1, 14)
                 print(f"[TECH]\n{tech_summary}")
             else:
                 print("[WARN] ไม่สามารถดึง candle data ได้ครบ – ใช้ price-only analysis")
+
+            risk = calculate_lot_size(atr_value=h1_atr)
+            lot_size  = risk["lot_size"]
+            sl_points = risk["sl_points"]
+            tp_points = risk["tp_points"]
 
             # ---- 3.5 ดึง Order Book ----
             print("[INFO] ดึง Order Book...")
@@ -1137,15 +1661,36 @@ def main_loop():
             j_history = journal_get_recent(5)
             j_knowledge = journal_get_knowledge()
 
+            # ---- 3.8 Win Rate ----
+            win_stats = get_recent_win_rate(3)
+            if win_stats["total"] > 0:
+                print(
+                    f"[STATS] 📊 3-day: {win_stats['wins']}W/{win_stats['losses']}L "
+                    f"({win_stats['win_rate']}%) | P/L: ${win_stats['total_profit']}"
+                )
+
             # ---- 4. AI วิเคราะห์ ----
             ai_cfg = _get_ai_config()
             print(f"[INFO] ส่งข้อมูลให้ AI ({ai_cfg['provider']}: {ai_cfg['model']})...")
+
+            # เพิ่ม win rate ลง journal knowledge
+            perf_context = ""
+            if win_stats["total"] >= 3:
+                perf_context = (
+                    f"\n=== BOT PERFORMANCE (Last 3 days) ===\n"
+                    f"Win Rate: {win_stats['win_rate']}% ({win_stats['wins']}W/{win_stats['losses']}L) "
+                    f"| Net P/L: ${win_stats['total_profit']}"
+                )
+                if win_stats["win_rate"] < 40:
+                    perf_context += "\n⚠️ Low win rate — be more selective, require stronger signals"
+
             analysis = analyze_with_ai(
                 price, tech_summary,
                 orderbook_summary=ob_summary,
                 news_summary=news_summary,
                 journal_history=j_history,
-                journal_knowledge=j_knowledge,
+                journal_knowledge=(j_knowledge + perf_context) if perf_context else j_knowledge,
+                scalp_tf=scalp_tf,
             )
             print(f"\n>>> 🤖 AI RESULT <<<\n{analysis}\n{'='*30}")
 

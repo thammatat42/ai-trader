@@ -245,6 +245,57 @@ def execute_trade(req: TradeRequest):
 
 
 # ==========================================
+# MODIFY SL/TP (for trailing stop & breakeven)
+# ==========================================
+class ModifySLTPRequest(BaseModel):
+    ticket: int
+    sl: float
+    tp: float | None = None  # None = keep current TP
+
+
+@app.post("/modify_sl")
+def modify_sl_tp(req: ModifySLTPRequest):
+    """
+    แก้ไข SL/TP ของ Position ที่เปิดอยู่ (สำหรับ trailing stop / breakeven)
+    """
+    if not ensure_mt5_connected():
+        return {"error": "MT5 is not connected", "success": False}
+
+    positions = mt5.positions_get(ticket=req.ticket)
+    if positions is None or len(positions) == 0:
+        return {"error": f"Position {req.ticket} not found", "success": False}
+
+    pos = positions[0]
+    new_tp = req.tp if req.tp is not None else pos.tp
+
+    modify_request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": pos.symbol,
+        "position": req.ticket,
+        "sl": req.sl,
+        "tp": new_tp,
+    }
+
+    result = mt5.order_send(modify_request)
+    if result is None:
+        return {"error": "order_send returned None", "success": False}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {
+            "error": f"Modify failed: {result.comment}",
+            "retcode": result.retcode,
+            "success": False,
+        }
+
+    return {
+        "success": True,
+        "ticket": req.ticket,
+        "new_sl": req.sl,
+        "new_tp": new_tp,
+    }
+
+
+# ==========================================
 # OPEN POSITIONS
 # ==========================================
 @app.get("/positions")
@@ -325,6 +376,72 @@ def get_history(days: int = Query(default=7, ge=1, le=90)):
         })
 
     return {"deals": result, "count": len(result)}
+
+
+# ==========================================
+# CLOSE POSITION (for smart position management)
+# ==========================================
+class CloseRequest(BaseModel):
+    ticket: int      # Position ticket to close
+
+
+@app.post("/close")
+def close_position(req: CloseRequest):
+    """
+    ปิด Position ตาม ticket number
+    ใช้สำหรับ Smart Position Manager (ปิด trade ที่ทำกำไรแล้ว)
+    """
+    if not ensure_mt5_connected():
+        return {"error": "MT5 is not connected", "success": False}
+
+    # ค้นหา position ที่ต้องการปิด
+    positions = mt5.positions_get(ticket=req.ticket)
+    if positions is None or len(positions) == 0:
+        return {"error": f"Position ticket {req.ticket} not found", "success": False}
+
+    pos = positions[0]
+
+    # กำหนด order type สำหรับปิด (ตรงข้ามกับ open)
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        price = mt5.symbol_info_tick(pos.symbol).bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        price = mt5.symbol_info_tick(pos.symbol).ask
+
+    close_request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": pos.symbol,
+        "volume": pos.volume,
+        "type": close_type,
+        "position": req.ticket,
+        "price": price,
+        "deviation": 20,
+        "magic": 888888,
+        "comment": "AI SmartClose",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(close_request)
+
+    if result is None:
+        return {"error": "order_send returned None", "success": False}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {
+            "error": f"Close failed: {result.comment}",
+            "retcode": result.retcode,
+            "success": False,
+        }
+
+    return {
+        "success": True,
+        "ticket": req.ticket,
+        "close_price": result.price,
+        "profit": pos.profit,
+        "symbol": pos.symbol,
+    }
 
 
 # ==========================================

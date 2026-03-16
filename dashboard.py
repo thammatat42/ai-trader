@@ -242,12 +242,13 @@ if page == "🏠 Overview":
     settings = run_query("SELECT * FROM bot_settings LIMIT 1;")
     if settings:
         s = settings[0]
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("Market", market_msg)
         col2.metric("Bot Status", "🟢 RUNNING" if s["is_running"] else "🔴 STOPPED")
         col3.metric("Interval", f"{s['interval_seconds']}s")
-        col4.metric("Max Trades/Day", s["max_trades_per_day"])
-        col5.metric("UTC Time", now_utc.strftime("%H:%M:%S"))
+        col4.metric("Scalp TF", s.get("scalp_timeframe", "M15"))
+        col5.metric("Max Trades/Day", s["max_trades_per_day"])
+        col6.metric("UTC Time", now_utc.strftime("%H:%M:%S"))
 
     st.divider()
 
@@ -692,7 +693,8 @@ elif page == "📈 Analysis Log":
 
     log_rows = run_query(
         """
-        SELECT id, symbol, bid, ask, ai_recommendation, lot_size, created_at
+        SELECT id, symbol, bid, ask, trade_action, ai_recommendation,
+               lot_size, sl_price, tp_price, created_at
         FROM ai_analysis_log
         WHERE created_at >= NOW() - (%s * INTERVAL '1 hour')
         ORDER BY created_at DESC
@@ -703,7 +705,28 @@ elif page == "📈 Analysis Log":
 
     if log_rows:
         df = pd.DataFrame(log_rows)
-        st.dataframe(df, use_container_width=True, height=500)
+
+        # Color-code trade_action
+        def color_action(val):
+            if val == "BUY":
+                return "color: #26a69a; font-weight: bold"
+            elif val == "SELL":
+                return "color: #ef5350; font-weight: bold"
+            return "color: #78909c"
+
+        # Summary counts
+        if "trade_action" in df.columns:
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            ac1.metric("Total", len(df))
+            ac2.metric("🟢 BUY", len(df[df["trade_action"] == "BUY"]))
+            ac3.metric("🔴 SELL", len(df[df["trade_action"] == "SELL"]))
+            ac4.metric("⏸️ WAIT", len(df[df["trade_action"] == "WAIT"]))
+
+        styled_df = df.style.applymap(
+            color_action, subset=["trade_action"]
+        ) if "trade_action" in df.columns else df
+
+        st.dataframe(styled_df, use_container_width=True, height=500)
 
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("📥 Export CSV", csv, "analysis_log.csv", "text/csv")
@@ -779,13 +802,26 @@ elif page == "🎛️ Bot Control":
             format_func=lambda x: {
                 60: "1 นาที",
                 120: "2 นาที",
-                300: "5 นาที (แนะนำ M15)",
+                300: "5 นาที",
                 600: "10 นาที",
-                900: "15 นาที (แนะนำ H1)",
+                900: "15 นาที",
                 1800: "30 นาที",
-                3600: "1 ชั่วโมง (แนะนำ H1-H4)",
+                3600: "1 ชั่วโมง",
             }.get(x, f"{x}s"),
         )
+
+        st.markdown("##### 📊 Scalp Timeframe")
+        scalp_tf_options = ["M1", "M5", "M15", "M30"]
+        current_scalp_tf = s.get("scalp_timeframe", "M15")
+        new_scalp_tf = st.selectbox(
+            "Scalp Timeframe (ใช้วิเคราะห์จังหวะสั้น + AI Prompt)",
+            options=scalp_tf_options,
+            index=scalp_tf_options.index(current_scalp_tf)
+            if current_scalp_tf in scalp_tf_options
+            else 2,
+            help="Timeframe สำหรับ Scalp ที่ Bot จะใช้วิเคราะห์ (M1/M5/M15/M30) — เปลี่ยนได้ทันทีโดยไม่ต้อง restart",
+        )
+
         new_max_trades = st.number_input(
             "Max Trades / Day", min_value=1, max_value=100, value=s["max_trades_per_day"]
         )
@@ -812,26 +848,28 @@ elif page == "🎛️ Bot Control":
                 UPDATE bot_settings
                 SET interval_seconds = %s, max_trades_per_day = %s,
                     pause_max_retries = %s, pause_retry_sec = %s,
+                    scalp_timeframe = %s,
                     updated_at = NOW();
                 """,
-                (new_interval, new_max_trades, new_max_retries, new_retry_sec),
+                (new_interval, new_max_trades, new_max_retries, new_retry_sec, new_scalp_tf),
             )
             run_command(
                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
-                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
+                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, scalp_tf={new_scalp_tf}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
             )
             st.success("✅ บันทึกสำเร็จ!")
             st.rerun()
 
     st.divider()
-    st.subheader("💡 Interval Guide")
+    st.subheader("💡 Interval & Timeframe Guide")
     st.markdown(
         """
-        | Timeframe | Interval ที่เหมาะสม | เหตุผล |
-        |-----------|---------------------|--------|
-        | **M15 (Scalping)** | 5 นาที (300s) | เช็คก่อนแท่งเทียนปิด |
-        | **H1** | 15 นาที (900s) | ลดค่า API, ลด Noise |
-        | **H4** | 1 ชั่วโมง (3600s) | เหมาะกับ Swing |
+        | Scalp TF | Interval ที่เหมาะสม | เหตุผล |
+        |----------|---------------------|--------|
+        | **M5** | 1-2 นาที (60-120s) | Scalp ระยะสั้นมาก |
+        | **M15** | 5 นาที (300s) | Scalp มาตรฐาน แนะนำ |
+        | **M30** | 10 นาที (600s) | Short Swing |
+        | **H1** | 15-30 นาที | Swing / Position |
         """
     )
 
