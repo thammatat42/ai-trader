@@ -1116,9 +1116,6 @@ def sync_closed_trades():
         print(f"[SYNC] ⚠️ sync open positions error: {e}")
 
 
-def log_event(event_type: str, message: str):
-
-
 # ==========================================
 # 4.6  SMART POSITION MANAGER
 # ==========================================
