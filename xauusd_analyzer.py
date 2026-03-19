@@ -27,6 +27,13 @@ _redis: redis.Redis | None = None
 _forecast_lock = threading.Lock()
 _forecast_cooldown: dict = {}  # ticket -> last_forecast_ts (rate limit AI calls)
 
+# Thread-safe lock for position state (shared between main loop and monitor thread)
+_position_state_lock = threading.Lock()
+
+# VPS health tracking (circuit breaker)
+_vps_failures = 0
+_vps_failure_window_start = 0.0
+
 
 def get_redis() -> redis.Redis | None:
     """Lazy-init Redis connection"""
@@ -154,7 +161,8 @@ def calculate_lot_size(atr_value: float | None = None) -> dict:
     risk_amount = balance * (risk_pct / 100)
     # FIX #4: correct formula — divide by dollar risk per lot
     lot_size = risk_amount / (sl_points * point_value_per_lot)
-    final_lot = max(0.01, round(lot_size, 2))
+    max_lot = float(os.getenv("MAX_LOT", 1.0))
+    final_lot = max(0.01, min(max_lot, round(lot_size, 2)))
 
     print(
         f"[RISK] Balance ${balance:,.2f} ({balance_src}) | Risk {risk_pct}% (${risk_amount:,.2f}) "
@@ -178,6 +186,43 @@ def get_price_from_mt5():
     except Exception as e:
         print(f"[ERROR] Cannot connect to Windows VPS: {e}")
         return None
+
+
+def check_vps_available() -> bool:
+    """Circuit breaker: auto-stop bot if VPS unreachable 3 times in 5 minutes."""
+    global _vps_failures, _vps_failure_window_start
+    try:
+        price = get_price_from_mt5()
+        if price and "error" not in price:
+            _vps_failures = 0
+            return True
+    except Exception:
+        pass
+    now = time.time()
+    if now - _vps_failure_window_start > 300:
+        _vps_failure_window_start = now
+        _vps_failures = 1
+    else:
+        _vps_failures += 1
+    if _vps_failures >= 3:
+        print("[CRITICAL] 🔴 VPS unreachable 3x in 5min → AUTO-STOP")
+        log_event("VPS_DOWN", "VPS unreachable 3 times in 5 minutes — auto-stopping bot")
+        return False
+    return True
+
+
+def is_consolidating(candles: list) -> bool:
+    """Detect sideways/chop market: narrow BB, low ATR, neutral RSI."""
+    if not candles or len(candles) < 20:
+        return False
+    closes = [c["close"] for c in candles[-20:]]
+    atr = calc_atr(candles, 14)
+    bb = calc_bollinger(closes, 20, 2.0)
+    rsi = calc_rsi(closes, 14)
+    if not (atr and bb and rsi):
+        return False
+    # BB bandwidth < 0.5% AND RSI neutral (40-60) = consolidation
+    return bb["bandwidth"] < 0.5 and 40 < rsi < 60
 
 
 def get_candles_from_mt5(timeframe: str = "H1", count: int = 50) -> list | None:
@@ -747,9 +792,16 @@ def parse_sentiment(ai_text: str) -> str:
             else:
                 sentiment = "WAIT"
             break
-    else:
-        # Fallback: explicit action keyword in first 2 lines only
-        header = " ".join(lines[:2]).lower()
+
+    # Fallback: search "Sentiment:" anywhere in response (AI sometimes verbose)
+    if sentiment == "WAIT":
+        m = re.search(r'sentiment[:\s]+(bullish|bearish)', ai_text.lower())
+        if m:
+            sentiment = "BUY" if m.group(1) == "bullish" else "SELL"
+
+    # Fallback 2: explicit action keyword in first 3 lines
+    if sentiment == "WAIT":
+        header = " ".join(lines[:3]).lower()
         m = re.search(r'(?:action|signal|recommendation)[:\s]*(buy|sell)', header)
         if m:
             sentiment = m.group(1).upper()
@@ -1077,11 +1129,17 @@ def analyze_with_ai(price_data, technical_summary: str = "",
 
         "DECISION RULES (need 3+ signals aligned):\n"
         "BUY: EMA9>EMA21 on H1+H4 | RSI 30-60 rising | MACD histogram positive/turning up | "
-        "BB%B<0.3 (oversold) | price bouncing at support | bullish candle pattern | buyer volume\n"
+        "BB%B<0.3 (oversold) | price bouncing at support | bullish candle pattern\n"
         "SELL: EMA9<EMA21 on H1+H4 | RSI 40-70 falling | MACD histogram negative/turning down | "
-        "BB%B>0.7 (overbought) | price rejected at resistance | bearish candle | seller volume\n"
+        "BB%B>0.7 (overbought) | price rejected at resistance | bearish candle\n"
         "WAIT: <3 signals aligned | RSI extreme >80/<20 | conflicting TF signals | "
-        "high-impact news pending <30min | price in tight range/chop\n\n"
+        "high-impact news pending <30min | BB bandwidth < 0.5% with RSI 40-60 (consolidation/chop)\n\n"
+
+        "SIDEWAYS/CONSOLIDATION RULES:\n"
+        "- If BB bandwidth is narrow (<0.5%) AND RSI is 40-60 AND no clear trend → market is consolidating\n"
+        "- In consolidation: prefer WAIT unless price is at clear Support (BUY) or Resistance (SELL)\n"
+        "- Consolidation BUY/SELL should use confidence 5-6 max (smaller position)\n"
+        "- If consolidation + imminent news → WAIT (breakout direction unknown)\n\n"
 
         "TRADE LOG ANALYSIS:\n"
         "- Review recent trades for patterns (e.g. repeated SL hits at same level = wrong side)\n"
@@ -1314,6 +1372,7 @@ def sync_closed_trades():
 POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 5))
 MIN_HOLD_SEC            = int(os.getenv("MIN_HOLD_SEC",   60))
 MAX_HOLD_SEC            = int(os.getenv("MAX_HOLD_SEC",   1800))
+MAX_HOLD_SEC_LOSS       = int(os.getenv("MAX_HOLD_SEC_LOSS", 600))  # Shorter hold for losing positions
 TRAILING_STEP_PRICE     = float(os.getenv("TRAILING_STEP_PRICE",   1.0))
 TRAILING_PROTECT_PCT    = float(os.getenv("TRAILING_PROTECT_PCT",  50))
 PROFIT_LOCK_PCT         = float(os.getenv("PROFIT_LOCK_PCT",        5.0))
@@ -1353,6 +1412,12 @@ _cached_atr_ts: float        = 0
 _last_prices: dict = {}  # ticket -> last_known_price
 # Track which positions already had partial close
 _partial_closed: set = set()
+# Track max profit seen per position (high watermark for trailing)
+_position_max_profit: dict = {}  # ticket -> max_profit_seen
+# Forecast failure tracking (backoff on repeated API failures)
+_forecast_failures: dict = {}  # ticket -> [fail_count, last_fail_ts]
+# Recovery whipsaw protection
+_recovery_attempts_recent: list = []  # [(timestamp, action)]
 
 
 def _get_account_balance() -> float:
@@ -1466,6 +1531,23 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
     if not candles_scalp or len(candles_scalp) < 10:
         return {"action": "CLOSE", "reason": f"Insufficient {scalp_tf} data"}
 
+    # Forecast failure backoff: skip AI if too many consecutive failures
+    fail_count = _forecast_failures.get("count", 0)
+    last_fail  = _forecast_failures.get("last_ts", 0)
+    if fail_count >= 3:
+        backoff_sec = min(300, 30 * (2 ** (fail_count - 3)))  # 30s, 60s, 120s, 300s max
+        if time.time() - last_fail < backoff_sec:
+            print(f"[FORECAST] ⏳ Backoff active ({fail_count} failures, wait {backoff_sec}s) — using technicals only")
+            closes = [c["close"] for c in candles_scalp]
+            ema_5 = calc_ema(closes, 5)
+            ema_10 = calc_ema(closes, 10)
+            if ema_5 and ema_10:
+                if position_type == "BUY" and ema_5 < ema_10:
+                    return {"action": "CLOSE", "reason": "EMA bearish crossover (backoff)"}
+                if position_type == "SELL" and ema_5 > ema_10:
+                    return {"action": "CLOSE", "reason": "EMA bullish crossover (backoff)"}
+            return {"action": "HOLD", "reason": f"AI backoff ({fail_count} failures), technicals neutral"}
+
     closes    = [c["close"] for c in candles_scalp]
     ema_5     = calc_ema(closes, 5)
     ema_10    = calc_ema(closes, 10)
@@ -1564,11 +1646,17 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
             response_time_ms=elapsed, status="OK_FORECAST",
         )
         reply = resp_json["choices"][0]["message"]["content"].strip().upper()
+        # Reset forecast failure counter on success
+        _forecast_failures.clear()
         if "CLOSE" in reply:
             return {"action": "CLOSE", "reason": reply}
         return {"action": "HOLD", "reason": reply}
     except Exception as e:
         print(f"[FORECAST] ⚠️ AI forecast failed: {e}")
+        # Track failures for exponential backoff
+        fail_count = _forecast_failures.get("count", 0) + 1
+        _forecast_failures["count"] = fail_count
+        _forecast_failures["last_ts"] = time.time()
         # Technical fallback
         if ema_5 and ema_10:
             if position_type == "BUY"  and ema_5 < ema_10:
@@ -1625,18 +1713,21 @@ def smart_position_monitor(scalp_tf: str = "M15"):
             hold_sec      = now_ts - open_time
 
             # ===== SPIKE DETECTION =====
-            # React immediately if price moved adversely by > SPIKE_THRESHOLD since last check
-            last_known = _last_prices.get(ticket)
-            _last_prices[ticket] = current_price
+            # React immediately if price moved adversely by > dynamic spike threshold
+            # Dynamic threshold: max(SPIKE_THRESHOLD, ATR×0.50) — adapts to volatility
+            effective_spike = max(SPIKE_THRESHOLD, round(atr * 0.50, 2)) if atr else SPIKE_THRESHOLD
+            with _position_state_lock:
+                last_known = _last_prices.get(ticket)
+                _last_prices[ticket] = current_price
             if last_known is not None:
                 price_delta = current_price - last_known
-                if pos_type == "BUY" and price_delta < -SPIKE_THRESHOLD and profit <= 0:
-                    print(f"[SPIKE] ⚡ #{ticket} BUY price dropped {price_delta:.2f} → CLOSE")
+                if pos_type == "BUY" and price_delta < -effective_spike and profit <= 0:
+                    print(f"[SPIKE] ⚡ #{ticket} BUY price dropped {price_delta:.2f} (threshold={effective_spike}) → CLOSE")
                     close_position_mt5(ticket)
                     log_event("SPIKE_CLOSE", f"#{ticket} BUY spike {price_delta:.2f}")
                     continue
-                if pos_type == "SELL" and price_delta > SPIKE_THRESHOLD and profit <= 0:
-                    print(f"[SPIKE] ⚡ #{ticket} SELL price surged +{price_delta:.2f} → CLOSE")
+                if pos_type == "SELL" and price_delta > effective_spike and profit <= 0:
+                    print(f"[SPIKE] ⚡ #{ticket} SELL price surged +{price_delta:.2f} (threshold={effective_spike}) → CLOSE")
                     close_position_mt5(ticket)
                     log_event("SPIKE_CLOSE", f"#{ticket} SELL spike +{price_delta:.2f}")
                     continue
@@ -1653,12 +1744,21 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 print(f"[PARTIAL] 🎯 #{ticket} profit=${profit:.2f} >= ${partial_close_usd:.2f} → close 50%")
                 result = partial_close_mt5(ticket, 0.5)
                 if result and result.get("success"):
-                    _partial_closed.add(ticket)
+                    with _position_state_lock:
+                        _partial_closed.add(ticket)
 
             # ===== 3-PHASE ADAPTIVE TRAILING STOP =====
             # Phase 1: small profit → tight trail (protect entry)
             # Phase 2: good profit → medium trail (survive normal swings)
             # Phase 3: after partial close → wide trail (let the runner go)
+
+            # Track max profit high watermark per position
+            with _position_state_lock:
+                prev_max = _position_max_profit.get(ticket, 0)
+                if profit > prev_max:
+                    _position_max_profit[ticket] = profit
+                max_profit_seen = _position_max_profit.get(ticket, 0)
+
             is_partial = ticket in _partial_closed
             if is_partial:
                 trail_gap = trail_gap_p3
@@ -1670,13 +1770,20 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 trail_gap = trail_gap_p1
                 phase_label = "P1-PROTECT"
 
+            # High watermark protection: if profit dropped >50% from peak, tighten trail
+            if max_profit_seen > 0 and profit > 0 and profit < max_profit_seen * 0.5:
+                trail_gap = trail_gap_p1  # tighten to P1
+                phase_label = f"P1-PROTECT(peak${max_profit_seen:.2f})"
+
             if current_sl != 0:
+                # Dynamic breakeven offset: ATR×0.10 (min $0.05, max $0.30)
+                be_offset = max(0.05, min(0.30, round(atr * 0.10, 2))) if atr else 0.10
                 if pos_type == "BUY":
                     distance = current_price - open_price
                     # Breakeven: move SL to entry once price moves BREAKEVEN_DISTANCE
                     if distance > BREAKEVEN_DISTANCE and current_sl < open_price:
-                        be_sl = round(open_price + 0.05, 2)
-                        print(f"[BREAKEVEN] 🔒 #{ticket} BUY → SL to {be_sl} (entry+0.05)")
+                        be_sl = round(open_price + be_offset, 2)
+                        print(f"[BREAKEVEN] 🔒 #{ticket} BUY → SL to {be_sl} (entry+{be_offset})")
                         modify_sl_mt5(ticket, be_sl)
                     # Adaptive trailing: gap depends on profit phase
                     elif profit >= breakeven_usd and distance > trail_gap:
@@ -1689,8 +1796,8 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     distance = open_price - current_price
                     # Breakeven
                     if distance > BREAKEVEN_DISTANCE and current_sl > open_price:
-                        be_sl = round(open_price - 0.05, 2)
-                        print(f"[BREAKEVEN] 🔒 #{ticket} SELL → SL to {be_sl} (entry-0.05)")
+                        be_sl = round(open_price - be_offset, 2)
+                        print(f"[BREAKEVEN] 🔒 #{ticket} SELL → SL to {be_sl} (entry-{be_offset})")
                         modify_sl_mt5(ticket, be_sl)
                     # Adaptive trailing
                     elif profit >= breakeven_usd and distance > trail_gap:
@@ -1699,12 +1806,31 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                             print(f"[TRAIL-{phase_label}] 📉 #{ticket} SL {current_sl}→{ideal_sl} (gap={trail_gap})")
                             modify_sl_mt5(ticket, ideal_sl)
 
+            # ===== TREND REVERSAL EXIT =====
+            # If position is held > 2min and H1 trend has reversed, close losing positions early
+            if hold_sec >= 120 and profit <= 0:
+                try:
+                    candles_h1_check = get_candles_from_mt5("H1", 30)
+                    if candles_h1_check and len(candles_h1_check) >= 21:
+                        closes_h1 = [c["close"] for c in candles_h1_check]
+                        ema9_h1 = calc_ema(closes_h1, 9)
+                        ema21_h1 = calc_ema(closes_h1, 21)
+                        if ema9_h1 and ema21_h1:
+                            h1_trend = "BUY" if ema9_h1 > ema21_h1 else "SELL"
+                            if pos_type != h1_trend:
+                                print(f"[TREND-EXIT] ⚠️ #{ticket} {pos_type} but H1 trend={h1_trend} (EMA9={ema9_h1:.2f} EMA21={ema21_h1:.2f}) profit=${profit:.2f} → CLOSE")
+                                close_position_mt5(ticket)
+                                log_event("TREND_REVERSAL_EXIT", f"#{ticket} {pos_type} closed — H1 trend reversed to {h1_trend}")
+                                continue
+                except Exception:
+                    pass  # trend reversal check is best-effort
+
             # ===== TIME + AI FORECAST DECISIONS =====
             if hold_sec < MIN_HOLD_SEC:
                 continue
-            if profit <= 0 and hold_sec < MAX_HOLD_SEC:
+            if profit <= 0 and hold_sec < MAX_HOLD_SEC_LOSS:
                 # Even when losing, check more often if hold time is getting long
-                if hold_sec > MAX_HOLD_SEC * 0.7:
+                if hold_sec > MAX_HOLD_SEC_LOSS * 0.7:
                     pass  # fall through to AI forecast
                 else:
                     continue
@@ -1726,12 +1852,12 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
             candles_scalp = get_candles_from_mt5(scalp_tf, 30)
 
-            if hold_sec >= MAX_HOLD_SEC and profit <= 0:
+            if hold_sec >= MAX_HOLD_SEC_LOSS and profit <= 0:
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
                 )
-                print(f"[SMART] ⏰ #{ticket} {hold_sec}s > MAX, loss ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
+                print(f"[SMART] ⏰ #{ticket} {hold_sec}s > MAX_LOSS, loss ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
                     close_position_mt5(ticket)
                 continue
@@ -1745,8 +1871,8 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 if forecast["action"] == "CLOSE":
                     close_position_mt5(ticket)
 
-            # Check losing positions approaching max hold (70-100% of MAX_HOLD_SEC)
-            if profit <= 0 and hold_sec > MAX_HOLD_SEC * 0.7:
+            # Check losing positions approaching max hold (70-100% of MAX_HOLD_SEC_LOSS)
+            if profit <= 0 and hold_sec > MAX_HOLD_SEC_LOSS * 0.7:
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
@@ -1761,10 +1887,14 @@ def smart_position_monitor(scalp_tf: str = "M15"):
             for t in list(_forecast_cooldown.keys()):
                 if t not in open_tickets:
                     del _forecast_cooldown[t]
-        for t in list(_last_prices.keys()):
-            if t not in open_tickets:
-                del _last_prices[t]
-        _partial_closed.difference_update(_partial_closed - open_tickets)
+        with _position_state_lock:
+            for t in list(_last_prices.keys()):
+                if t not in open_tickets:
+                    del _last_prices[t]
+            _partial_closed.difference_update(_partial_closed - open_tickets)
+            for t in list(_position_max_profit.keys()):
+                if t not in open_tickets:
+                    del _position_max_profit[t]
 
     except Exception as e:
         print(f"[SMART] ⚠️ Position monitor error: {e}")
@@ -2113,6 +2243,14 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
         print("[RECOVERY] ⏳ Recovery cooldown active, skipping")
         return False
 
+    # Whipsaw protection: max 3 recovery attempts per hour
+    # Prune attempts older than 1 hour
+    _recovery_attempts_recent[:] = [ts for ts, _ in _recovery_attempts_recent if now - ts < 3600]
+    if len(_recovery_attempts_recent) >= 3:
+        print(f"[RECOVERY] ⛔ Whipsaw protection: {len(_recovery_attempts_recent)} recovery attempts in last hour — pausing")
+        log_event("RECOVERY_WHIPSAW", f"{len(_recovery_attempts_recent)} attempts in 1hr")
+        return False
+
     _last_recovery_ts = now
     print("[RECOVERY] 🔄 Running post-loss recovery analysis...")
 
@@ -2261,6 +2399,7 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
 
         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
         if trade_result and trade_result.get("success"):
+            _recovery_attempts_recent.append((time.time(), action))
             print(f"[RECOVERY] ✅ Recovery {action} | lot={lot_size} (half-risk) conf={confidence} SL={sl_price} TP={tp_price}")
             log_event("RECOVERY_TRADE", f"{action} lot={lot_size} conf={confidence} after losses")
             save_trade_to_db(
@@ -2350,9 +2489,13 @@ def main_loop():
         BAD_HOURS_UTC     = [int(h) for h in os.getenv("BAD_HOURS_UTC", "2,3,4,5,6").split(",") if h.strip()]
         current_hour_utc  = datetime.now(timezone.utc).hour
         if current_hour_utc in BAD_HOURS_UTC:
-            print(f"[TIME] ⏰ Hour {current_hour_utc:02d} UTC in bad-hours {BAD_HOURS_UTC} – skipping")
+            # Calculate minutes until next good hour instead of sleeping fixed 60s
+            now_utc = datetime.now(timezone.utc)
+            minutes_left = 60 - now_utc.minute
+            sleep_sec = min(minutes_left * 60, 3600)  # cap at 1 hour
+            print(f"[TIME] ⏰ Hour {current_hour_utc:02d} UTC in bad-hours {BAD_HOURS_UTC} – sleeping {sleep_sec}s (~{minutes_left}min to next hour)")
             sync_closed_trades()
-            time.sleep(60)
+            time.sleep(sleep_sec)
             continue
 
         # ---- Consecutive loss pause (with recovery attempt) ----
@@ -2392,6 +2535,21 @@ def main_loop():
 
         try:
             print(f"\n=== 🟢 AI Trader Node | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+
+            # ---- VPS health check (circuit breaker) ----
+            if not check_vps_available():
+                print("[CRITICAL] 🔴 VPS unreachable (circuit breaker open) — stopping bot")
+                log_event("VPS_CIRCUIT_BREAK", "VPS unreachable — auto-stop")
+                try:
+                    conn = get_db_connection()
+                    cur  = conn.cursor()
+                    cur.execute("UPDATE bot_settings SET is_running = FALSE, updated_at = NOW();")
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
+                break
 
             # ---- Fetch price ----
             price = get_price_from_mt5()
@@ -2442,6 +2600,7 @@ def main_loop():
             tech_summary = ""
             h1_atr       = None
             trend_info   = None
+            consolidating = False
             if candles_h1 and candles_h4 and candles_d1:
                 tech_summary = build_technical_summary(
                     candles_h1, candles_h4, candles_d1,
@@ -2451,6 +2610,11 @@ def main_loop():
                 trend_info = get_trend_alignment(candles_h1, candles_h4, candles_d1)
                 print(f"[TECH]\n{tech_summary}")
                 print(f"[TREND] Direction={trend_info['direction']} Strength={trend_info['strength']}/3 ({trend_info['details']})")
+
+                # ---- Consolidation detection ----
+                consolidating = is_consolidating(candles_h1)
+                if consolidating:
+                    print("[CONSOLIDATION] ⚠️ Market is sideways (BB narrow + RSI neutral) — extra caution")
             else:
                 print("[WARN] Incomplete candle data – price-only analysis")
 
@@ -2464,6 +2628,12 @@ def main_loop():
             if consec_losses_now >= 2:
                 reduced_lot = max(0.01, round(lot_size * 0.5, 2))
                 print(f"[RISK] ⚠️ {consec_losses_now} consecutive losses → lot {lot_size} → {reduced_lot} (50% reduction)")
+                lot_size = reduced_lot
+
+            # Consolidation risk reduction: halve lot when market is sideways
+            if consolidating:
+                reduced_lot = max(0.01, round(lot_size * 0.5, 2))
+                print(f"[RISK] ⚠️ Consolidation → lot {lot_size} → {reduced_lot} (50% reduction)")
                 lot_size = reduced_lot
 
             # ---- Order book ----
@@ -2523,6 +2693,13 @@ def main_loop():
                 extra_knowledge += perf_context
             if trend_context:
                 extra_knowledge += trend_context
+            if consolidating:
+                extra_knowledge += (
+                    "\n=== CONSOLIDATION WARNING ===\n"
+                    "Market is currently CONSOLIDATING (narrow BB bandwidth + neutral RSI). "
+                    "Prefer WAIT unless price is at clear Support/Resistance with strong candle confirmation. "
+                    "If recommending BUY/SELL during consolidation, use confidence 5-6 max.\n"
+                )
 
             analysis = analyze_with_ai(
                 price, tech_summary,
@@ -2576,18 +2753,25 @@ def main_loop():
                         sl_price = round(bid + sl_points * 0.01, 2)
                         tp_price = round(bid - tp_points * 0.01, 2)
 
-                    trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
-                    if trade_result and trade_result.get("success"):
-                        log_event("TRADE", f"{action} {symbol} Lot={lot_size} SL={sl_price} TP={tp_price}")
-                        save_trade_to_db(
-                            order_id=trade_result["order_id"],
-                            symbol=symbol,
-                            action=action,
-                            lot=lot_size,
-                            open_price=trade_result.get("price", ask if action == "BUY" else bid),
-                            sl_price=sl_price,
-                            tp_price=tp_price,
-                        )
+                    # Sync closed trades + re-check position count before opening
+                    sync_closed_trades()
+                    open_count_recheck = count_open_positions(symbol)
+                    if open_count_recheck >= MAX_CONCURRENT_POS:
+                        print(f"[GUARD] 🛡️ Position limit reached after sync ({open_count_recheck}/{MAX_CONCURRENT_POS}) — skipping")
+                        action = "WAIT"
+                    else:
+                        trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
+                        if trade_result and trade_result.get("success"):
+                            log_event("TRADE", f"{action} {symbol} Lot={lot_size} SL={sl_price} TP={tp_price}")
+                            save_trade_to_db(
+                                order_id=trade_result["order_id"],
+                                symbol=symbol,
+                                action=action,
+                                lot=lot_size,
+                                open_price=trade_result.get("price", ask if action == "BUY" else bid),
+                                sl_price=sl_price,
+                                tp_price=tp_price,
+                            )
 
             # ---- Save log ----
             save_log_to_db(symbol, bid, ask, analysis, lot_size,
