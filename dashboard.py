@@ -7,6 +7,8 @@ Run:  streamlit run dashboard.py --server.port 8501
 
 import os
 import time
+import hashlib
+import secrets
 import psycopg2
 import psycopg2.extras
 import pandas as pd
@@ -177,6 +179,79 @@ hr {
 }
 </style>
 """, unsafe_allow_html=True)
+
+# ==========================================
+# AUTHENTICATION
+# ==========================================
+def _hash_password(password: str) -> str:
+    """Hash password with SHA-256 + salt from env."""
+    salt = os.getenv("DASHBOARD_SALT", "ai-gold-trader-2024")
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+
+
+def _check_auth() -> bool:
+    """Check if user is authenticated. Returns True if auth is disabled or user logged in."""
+    dashboard_pw = os.getenv("DASHBOARD_PASSWORD", "")
+    if not dashboard_pw:
+        # No password set → dashboard is open (backward compatible)
+        return True
+    return st.session_state.get("authenticated", False)
+
+
+def _render_login_page():
+    """Render the login page and handle authentication."""
+    dashboard_pw = os.getenv("DASHBOARD_PASSWORD", "")
+
+    st.markdown("""
+    <div style="display: flex; justify-content: center; align-items: center; min-height: 70vh;">
+        <div style="
+            background: linear-gradient(135deg, #1e293b 0%, #162032 100%);
+            border: 1px solid #334155;
+            border-radius: 16px;
+            padding: 48px 40px;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            text-align: center;
+        ">
+            <div style="font-size: 3rem; margin-bottom: 8px;">🥇</div>
+            <h2 style="color: #f59e0b !important; margin: 0 0 4px 0;">AI Gold Trader</h2>
+            <p style="color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px;">
+                กรุณายืนยันตัวตนเพื่อเข้าใช้งาน Dashboard
+            </p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Center the form
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("login_form", clear_on_submit=True):
+            password = st.text_input("🔑 Password", type="password", placeholder="Enter dashboard password")
+            submit = st.form_submit_button("เข้าสู่ระบบ", use_container_width=True, type="primary")
+
+            if submit:
+                if not password:
+                    st.error("กรุณาใส่รหัสผ่าน")
+                elif _hash_password(password) == _hash_password(dashboard_pw):
+                    st.session_state["authenticated"] = True
+                    st.session_state["auth_time"] = datetime.now(timezone.utc).isoformat()
+                    st.rerun()
+                else:
+                    st.error("❌ รหัสผ่านไม่ถูกต้อง")
+
+        st.markdown("""
+        <p style="color: #475569; font-size: 0.75rem; text-align: center; margin-top: 16px;">
+            ตั้งค่ารหัสผ่านได้ที่ DASHBOARD_PASSWORD ใน .env
+        </p>
+        """, unsafe_allow_html=True)
+
+
+# ── Auth Gate: block all content if not authenticated ──
+if not _check_auth():
+    _render_login_page()
+    st.stop()
+
 
 # ==========================================
 # DB HELPER
@@ -370,6 +445,13 @@ auto_refresh = st.sidebar.toggle("🔄 Auto-Refresh (10s)", value=False)
 if auto_refresh:
     time.sleep(10)
     st.rerun()
+
+# Logout button (only show when password is set)
+if os.getenv("DASHBOARD_PASSWORD", ""):
+    st.sidebar.divider()
+    if st.sidebar.button("🚪 ออกจากระบบ", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
 
 
 # ==========================================
