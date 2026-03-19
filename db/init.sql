@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS trades (
 -- ==========================================
 CREATE TABLE IF NOT EXISTS bot_settings (
     id                  SERIAL PRIMARY KEY,
-    is_running          BOOLEAN   NOT NULL DEFAULT TRUE,
+    is_running          BOOLEAN   NOT NULL DEFAULT FALSE,  -- เริ่มต้น STOPPED ต้องกด Start ผ่าน Dashboard
     interval_seconds    INTEGER   NOT NULL DEFAULT 300,
     max_trades_per_day  INTEGER   NOT NULL DEFAULT 10,
     pause_max_retries   INTEGER   NOT NULL DEFAULT 5,     -- จำนวนครั้ง retry ขณะ BREAKPOINT (0 = retry ไม่จำกัด)
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS bot_settings (
 );
 
 INSERT INTO bot_settings (is_running, interval_seconds, max_trades_per_day, pause_max_retries, pause_retry_sec, scalp_timeframe)
-SELECT TRUE, 300, 10, 5, 10, 'M15'
+SELECT FALSE, 300, 10, 5, 10, 'M15'
 WHERE NOT EXISTS (SELECT 1 FROM bot_settings);
 
 -- ==========================================

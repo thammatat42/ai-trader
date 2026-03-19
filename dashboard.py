@@ -1276,23 +1276,42 @@ elif page == "🤖 AI Models":
         st.code(open("db/migrate_add_ai_model_config.sql").read() if os.path.exists("db/migrate_add_ai_model_config.sql") else "-- Migration file not found", language="sql")
         st.stop()
 
-    # --- Current Active Model ---
-    st.markdown("### ⚡ Active Model")
-    active_model = run_query(
-        "SELECT * FROM ai_model_config WHERE is_active = TRUE ORDER BY updated_at DESC LIMIT 1;"
-    )
-    if active_model:
-        am = active_model[0]
-        am_col1, am_col2, am_col3, am_col4 = st.columns(4)
-        am_col1.metric("Provider", am["provider"].title())
-        am_col2.metric("Model", am["display_name"] or am["model"])
-        am_col3.metric("Max Tokens", am["max_tokens"])
-        am_col4.metric("Temperature", f"{am['temperature']}")
-        st.markdown(
-            f"""<div class="card-panel">
-            <h4>Currently Active</h4>
-            <b>Model:</b> {am['model']}<br>
-            <b>API URL:</b> {am['api_url']}<br>
+    # --- Current Active Models (by role) ---
+    st.markdown("### ⚡ Active Models")
+
+    # Check if model_role column exists
+    role_col_check = run_query("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'ai_model_config' AND column_name = 'model_role'
+        ) AS exists;
+    """)
+    has_role_col = role_col_check and role_col_check[0]["exists"]
+
+    if has_role_col:
+        active_models = run_query(
+            "SELECT * FROM ai_model_config WHERE is_active = TRUE ORDER BY model_role, updated_at DESC;"
+        )
+    else:
+        active_models = run_query(
+            "SELECT * FROM ai_model_config WHERE is_active = TRUE ORDER BY updated_at DESC LIMIT 1;"
+        )
+
+    if active_models:
+        for am in active_models:
+            role_label = am.get("model_role", "main").upper() if has_role_col else "MAIN"
+            role_emoji = "🧠" if role_label == "MAIN" else "⚡"
+            am_col1, am_col2, am_col3, am_col4, am_col5 = st.columns(5)
+            am_col1.metric("Role", f"{role_emoji} {role_label}")
+            am_col2.metric("Provider", am["provider"].title())
+            am_col3.metric("Model", am["display_name"] or am["model"])
+            am_col4.metric("Max Tokens", am["max_tokens"])
+            am_col5.metric("Temperature", f"{am['temperature']}")
+            st.markdown(
+                f"""<div class="card-panel">
+                <h4>{role_emoji} {role_label} — {am['display_name'] or am['model']}</h4>
+                <b>Model:</b> {am['model']}<br>
+                <b>API URL:</b> {am['api_url']}<br>
             <b>API Key:</b> {'*' * 8 + am['api_key'][-4:] if len(am['api_key']) > 4 else '***'}<br>
             <b>Last Updated:</b> {am['updated_at'].strftime('%Y-%m-%d %H:%M') if am['updated_at'] else 'N/A'}
             </div>""",
@@ -1305,16 +1324,21 @@ elif page == "🤖 AI Models":
 
     # --- All Models ---
     st.markdown("### 📋 All Configured Models")
-    all_models = run_query("SELECT * FROM ai_model_config ORDER BY is_active DESC, updated_at DESC;")
+    if has_role_col:
+        all_models = run_query("SELECT * FROM ai_model_config ORDER BY model_role, is_active DESC, updated_at DESC;")
+    else:
+        all_models = run_query("SELECT * FROM ai_model_config ORDER BY is_active DESC, updated_at DESC;")
 
     if all_models:
         for model in all_models:
             with st.container():
                 active_badge = "🟢 ACTIVE" if model["is_active"] else "⚪ Inactive"
+                role_str = model.get("model_role", "main").upper() if has_role_col else ""
+                role_badge = f" [{role_str}]" if role_str else ""
                 display = model["display_name"] or model["model"]
                 st.markdown(
                     f"""<div class="card-panel">
-                    <h4>{display} <span style="font-size:0.8rem;">{active_badge}</span></h4>
+                    <h4>{display}{role_badge} <span style="font-size:0.8rem;">{active_badge}</span></h4>
                     <span class="text-muted">Provider: {model['provider']} | Model: {model['model']} |
                     Tokens: {model['max_tokens']} | Temp: {model['temperature']}</span>
                     </div>""",
@@ -1326,17 +1350,25 @@ elif page == "🤖 AI Models":
                 with btn_col1:
                     if not model["is_active"]:
                         if st.button(f"✅ Activate", key=f"activate_{model['id']}"):
-                            # Deactivate all, then activate this one
-                            run_command("UPDATE ai_model_config SET is_active = FALSE, updated_at = NOW();")
+                            m_role = model.get("model_role", "main") if has_role_col else None
+                            if has_role_col and m_role:
+                                # Deactivate only models with the SAME role
+                                run_command(
+                                    "UPDATE ai_model_config SET is_active = FALSE, updated_at = NOW() WHERE model_role = %s;",
+                                    (m_role,),
+                                )
+                            else:
+                                run_command("UPDATE ai_model_config SET is_active = FALSE, updated_at = NOW();")
                             run_command(
                                 "UPDATE ai_model_config SET is_active = TRUE, updated_at = NOW() WHERE id = %s;",
                                 (model["id"],),
                             )
+                            role_info = f" (role={m_role})" if m_role else ""
                             run_command(
                                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
-                                ("CONFIG_CHANGE", f"AI model switched to {model['provider']}/{model['model']}"),
+                                ("CONFIG_CHANGE", f"AI model switched to {model['provider']}/{model['model']}{role_info}"),
                             )
-                            st.success(f"Activated: {display}")
+                            st.success(f"Activated: {display}{role_info}")
                             st.rerun()
 
                 with btn_col2:
@@ -1392,28 +1424,51 @@ elif page == "🤖 AI Models":
             edit_display = st.text_input("Display Name", value=sel["display_name"] or "")
             edit_provider = st.selectbox(
                 "Provider",
-                ["nvidia", "openrouter"],
-                index=0 if sel["provider"] == "nvidia" else 1,
+                ["openrouter", "nvidia"],
+                index=1 if sel["provider"] == "nvidia" else 0,
             )
             edit_model = st.text_input("Model ID", value=sel["model"])
             edit_url = st.text_input("API URL", value=sel["api_url"])
             edit_key = st.text_input("API Key", value=sel["api_key"], type="password")
             edit_tokens = st.number_input("Max Tokens", 50, 4096, int(sel["max_tokens"]))
             edit_temp = st.number_input("Temperature", 0.0, 2.0, float(sel["temperature"]), step=0.05)
+            if has_role_col:
+                current_role = sel.get("model_role", "main") or "main"
+                edit_role = st.selectbox(
+                    "Model Role",
+                    ["main", "forecast"],
+                    index=0 if current_role == "main" else 1,
+                    help="main = Full BUY/SELL/WAIT analysis | forecast = Quick HOLD/CLOSE position check"
+                )
+            else:
+                edit_role = "main"
             edit_notes = st.text_area("Notes", value=sel.get("notes") or "")
 
             if st.form_submit_button("💾 Save Changes"):
-                run_command(
-                    """
-                    UPDATE ai_model_config
-                    SET display_name = %s, provider = %s, model = %s,
-                        api_url = %s, api_key = %s, max_tokens = %s,
-                        temperature = %s, notes = %s, updated_at = NOW()
-                    WHERE id = %s;
-                    """,
-                    (edit_display, edit_provider, edit_model, edit_url, edit_key,
-                     edit_tokens, edit_temp, edit_notes, sel["id"]),
-                )
+                if has_role_col:
+                    run_command(
+                        """
+                        UPDATE ai_model_config
+                        SET display_name = %s, provider = %s, model = %s,
+                            api_url = %s, api_key = %s, max_tokens = %s,
+                            temperature = %s, model_role = %s, notes = %s, updated_at = NOW()
+                        WHERE id = %s;
+                        """,
+                        (edit_display, edit_provider, edit_model, edit_url, edit_key,
+                         edit_tokens, edit_temp, edit_role, edit_notes, sel["id"]),
+                    )
+                else:
+                    run_command(
+                        """
+                        UPDATE ai_model_config
+                        SET display_name = %s, provider = %s, model = %s,
+                            api_url = %s, api_key = %s, max_tokens = %s,
+                            temperature = %s, notes = %s, updated_at = NOW()
+                        WHERE id = %s;
+                        """,
+                        (edit_display, edit_provider, edit_model, edit_url, edit_key,
+                         edit_tokens, edit_temp, edit_notes, sel["id"]),
+                    )
                 st.success(f"Updated: {edit_display or edit_model}")
                 st.rerun()
 
@@ -1422,28 +1477,49 @@ elif page == "🤖 AI Models":
     # --- Add New Model ---
     st.markdown("### ➕ Add New Model")
     with st.form("add_model_form"):
-        new_display = st.text_input("Display Name", placeholder="e.g. GPT-4o (OpenRouter)")
-        new_provider = st.selectbox("Provider", ["nvidia", "openrouter"], key="new_provider")
-        new_model = st.text_input("Model ID", placeholder="e.g. meta/llama-3.1-70b-instruct")
-        new_url = st.text_input("API URL", placeholder="https://...")
+        new_display = st.text_input("Display Name", placeholder="e.g. DeepSeek V3.2 (Main Analysis)")
+        new_provider = st.selectbox("Provider", ["openrouter", "nvidia"], key="new_provider")
+        new_model = st.text_input("Model ID", placeholder="e.g. deepseek/deepseek-v3.2")
+        new_url = st.text_input("API URL", placeholder="https://openrouter.ai/api/v1/chat/completions")
         new_key = st.text_input("API Key", type="password")
         new_tokens = st.number_input("Max Tokens", 50, 4096, 400, key="new_tokens")
         new_temp = st.number_input("Temperature", 0.0, 2.0, 0.10, step=0.05, key="new_temp")
+        if has_role_col:
+            new_role = st.selectbox(
+                "Model Role",
+                ["main", "forecast"],
+                key="new_role",
+                help="main = Full BUY/SELL/WAIT analysis | forecast = Quick HOLD/CLOSE position check"
+            )
+        else:
+            new_role = "main"
         new_notes = st.text_area("Notes", key="new_notes")
 
         if st.form_submit_button("➕ Add Model"):
             if new_model and new_url and new_key:
-                run_command(
-                    """
-                    INSERT INTO ai_model_config
-                        (provider, model, api_key, api_url, is_active, display_name,
-                         max_tokens, temperature, notes)
-                    VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s);
-                    """,
-                    (new_provider, new_model, new_key, new_url,
-                     new_display or new_model, new_tokens, new_temp, new_notes),
-                )
-                st.success(f"Added: {new_display or new_model}")
+                if has_role_col:
+                    run_command(
+                        """
+                        INSERT INTO ai_model_config
+                            (provider, model, api_key, api_url, is_active, display_name,
+                             max_tokens, temperature, model_role, notes)
+                        VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s, %s);
+                        """,
+                        (new_provider, new_model, new_key, new_url,
+                         new_display or new_model, new_tokens, new_temp, new_role, new_notes),
+                    )
+                else:
+                    run_command(
+                        """
+                        INSERT INTO ai_model_config
+                            (provider, model, api_key, api_url, is_active, display_name,
+                             max_tokens, temperature, notes)
+                        VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s);
+                        """,
+                        (new_provider, new_model, new_key, new_url,
+                         new_display or new_model, new_tokens, new_temp, new_notes),
+                    )
+                st.success(f"Added: {new_display or new_model} (role={new_role})")
                 st.rerun()
             else:
                 st.error("Model ID, API URL, and API Key are required.")
@@ -1606,6 +1682,46 @@ elif page == "🎛️ Bot Control":
             )
             st.success("✅ Settings saved!")
             st.rerun()
+
+    st.divider()
+
+    # --- Friday Auto-Close Status ---
+    st.markdown("### 🔒 Friday Auto-Close (Weekend Gap Protection)")
+    fri_enabled = os.getenv("FRIDAY_AUTO_CLOSE", "true").lower() in ("true", "1", "yes")
+    fri_close_min = int(os.getenv("FRIDAY_CLOSE_MINUTES_BEFORE", 30))
+    fri_no_trade_min = int(os.getenv("FRIDAY_NO_NEW_TRADE_MINUTES", 60))
+
+    fri_col1, fri_col2, fri_col3 = st.columns(3)
+    with fri_col1:
+        if fri_enabled:
+            st.markdown("**Status:** ✅ ENABLED")
+        else:
+            st.markdown("**Status:** ❌ DISABLED")
+    with fri_col2:
+        st.metric("Close positions at", f"Fri {22 - fri_close_min // 60}:{fri_close_min % 60:02d} UTC")
+    with fri_col3:
+        st.metric("Block new trades at", f"Fri {22 - fri_no_trade_min // 60}:{fri_no_trade_min % 60:02d} UTC")
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() == 4:  # Friday
+        mins_to_close = (22 * 60) - (now_utc.hour * 60 + now_utc.minute)
+        if mins_to_close > 0:
+            st.info(f"⏰ Today is Friday — **{mins_to_close} minutes** until market close (22:00 UTC)")
+            if mins_to_close <= fri_no_trade_min:
+                st.warning("🔒 New trades are currently BLOCKED (Friday close window)")
+            if mins_to_close <= fri_close_min:
+                st.error("⚠️ Position close-out is ACTIVE — all positions being closed")
+        else:
+            st.success("Market is closed for the weekend")
+
+    # Recent Friday close events
+    fri_events = run_query(
+        "SELECT created_at, message FROM bot_events WHERE event_type IN ('FRIDAY_CLOSE', 'FRIDAY_CLOSE_DONE') ORDER BY created_at DESC LIMIT 5;"
+    )
+    if fri_events:
+        st.markdown("**Recent Friday Close Events:**")
+        for ev in fri_events:
+            st.text(f"  {ev['created_at']} — {ev['message']}")
 
     st.divider()
     st.subheader("💡 Interval & Timeframe Guide")
@@ -1951,25 +2067,53 @@ elif page == "🔑 API Usage":
 # ==========================================
 st.sidebar.divider()
 
-# Show active AI model from DB or env fallback
-_active_ai = run_query(
-    "SELECT provider, model, display_name FROM ai_model_config WHERE is_active = TRUE LIMIT 1;"
-) if run_query(
+# Show active AI models from DB or env fallback
+_ai_table_exists = run_query(
     "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'ai_model_config') AS e;"
-)[0]["e"] else None
+)[0]["e"]
 
-if _active_ai and _active_ai[0]:
-    _ai_prov = _active_ai[0]["provider"]
-    _ai_model = _active_ai[0]["display_name"] or _active_ai[0]["model"]
-else:
+_main_model_str = ""
+_forecast_model_str = ""
+
+if _ai_table_exists:
+    # Check if model_role column exists
+    _has_role = run_query("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns
+            WHERE table_name = 'ai_model_config' AND column_name = 'model_role'
+        ) AS e;
+    """)[0]["e"]
+
+    if _has_role:
+        _active_models = run_query(
+            "SELECT provider, model, display_name, model_role FROM ai_model_config WHERE is_active = TRUE ORDER BY model_role;"
+        )
+        for _am in (_active_models or []):
+            _label = _am["display_name"] or _am["model"]
+            if _am.get("model_role") == "forecast":
+                _forecast_model_str = f"<b class='gold-accent'>⚡ Forecast:</b> {_label}<br>"
+            else:
+                _main_model_str = f"<b class='gold-accent'>🧠 Main:</b> {_label}<br>"
+    else:
+        _active_ai = run_query(
+            "SELECT provider, model, display_name FROM ai_model_config WHERE is_active = TRUE LIMIT 1;"
+        )
+        if _active_ai:
+            _main_model_str = f"<b class='gold-accent'>🧠 Engine:</b> {_active_ai[0]['display_name'] or _active_ai[0]['model']}<br>"
+
+if not _main_model_str:
     _ai_prov = os.getenv("AI_PROVIDER", "openrouter").lower()
     _ai_model = os.getenv("NVIDIA_MODEL", "N/A") if _ai_prov == "nvidia" else os.getenv("MODEL", "N/A")
+    _main_model_str = f"<b class='gold-accent'>🧠 Engine:</b> {_ai_model} ({_ai_prov})<br>"
+
+if not _forecast_model_str:
+    _fc = os.getenv("FORECAST_MODEL")
+    if _fc:
+        _forecast_model_str = f"<b class='gold-accent'>⚡ Forecast:</b> {_fc}<br>"
 
 st.sidebar.markdown(f"""
 <div class="text-muted">
-<b class="gold-accent">Engine:</b> {_ai_model}<br>
-<b class="gold-accent">Symbol:</b> XAUUSD<br>
-<b class="gold-accent">Provider:</b> {_ai_prov.title()}
+{_main_model_str}{_forecast_model_str}<b class="gold-accent">Symbol:</b> XAUUSD
 </div>
 """, unsafe_allow_html=True)
 st.sidebar.caption(f"AI Gold Trader v2.1 Enterprise • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
