@@ -465,8 +465,8 @@ HIGH_IMPACT_KEYWORDS = ["nonfarm", "nfp", "fomc", "cpi", "ppi", "gdp", "interest
 
 
 def fetch_economic_calendar() -> list[dict]:
-    api_key = os.getenv("FINNHUB_API_KEY")
-    if not api_key:
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if not api_key or api_key.startswith("your-"):
         return []
 
     r = get_redis()
@@ -485,8 +485,7 @@ def fetch_economic_calendar() -> list[dict]:
             headers={"X-Finnhub-Token": api_key},
             timeout=10,
         )
-        if resp.status_code == 403:
-            print("[WARN] Finnhub calendar: 403 Forbidden")
+        if resp.status_code in (401, 403):
             return []
         resp.raise_for_status()
         events = resp.json().get("economicCalendar", [])
@@ -516,8 +515,8 @@ def fetch_economic_calendar() -> list[dict]:
 
 
 def fetch_market_news() -> list[dict]:
-    api_key = os.getenv("FINNHUB_API_KEY")
-    if not api_key:
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if not api_key or api_key.startswith("your-"):
         return []
 
     r = get_redis()
@@ -534,8 +533,7 @@ def fetch_market_news() -> list[dict]:
             headers={"X-Finnhub-Token": api_key},
             timeout=10,
         )
-        if resp.status_code == 403:
-            print("[WARN] Finnhub news: 403 Forbidden")
+        if resp.status_code in (401, 403):
             return []
         resp.raise_for_status()
         articles = resp.json()
