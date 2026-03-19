@@ -1,8 +1,8 @@
 """
-🎛️  AI Trader – Admin Dashboard (Streamlit)
-=============================================
-ใช้ควบคุม Bot, ดู Reports, ดู Event Log และปรับ Settings
-รันด้วย:  streamlit run dashboard.py --server.port 8501
+AI Trader - Admin Dashboard (Streamlit)
+========================================
+Control bot, view reports/events, manage AI models.
+Run:  streamlit run dashboard.py --server.port 8501
 """
 
 import os
@@ -13,6 +13,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import requests as req_lib
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -231,12 +232,11 @@ def run_command(sql, params=None):
 
 
 # ==========================================
-# MT5 API HELPER – ดึงข้อมูลจาก Windows VPS
+# MT5 API HELPER
 # ==========================================
-import requests as req_lib
 
 def mt5_api(endpoint: str, params: dict = None, timeout: int = 8):
-    """เรียก MT5 Bridge API บน Windows VPS"""
+    """Call MT5 Bridge API on Windows VPS"""
     windows_ip = os.getenv("WINDOWS_IP", "")
     if not windows_ip:
         return None
@@ -252,9 +252,9 @@ def mt5_api(endpoint: str, params: dict = None, timeout: int = 8):
 
 def sync_mt5_to_db():
     """
-    ซิงค์ข้อมูลจาก MT5 → trades table ใน PostgreSQL
-    - /positions → UPSERT เป็น OPEN trades
-    - /history   → UPSERT เป็น CLOSED trades
+    Sync data from MT5 to trades table in PostgreSQL.
+    - /positions -> UPSERT as OPEN trades
+    - /history   -> UPSERT as CLOSED trades
     """
     synced = 0
 
@@ -356,11 +356,12 @@ def sync_mt5_to_db():
 # SIDEBAR – NAVIGATION
 # ==========================================
 st.sidebar.markdown("# 🥇 AI Gold Trader")
-st.sidebar.caption("Enterprise Dashboard v2.0")
+st.sidebar.caption("Enterprise Dashboard v2.1")
 st.sidebar.divider()
 page = st.sidebar.radio(
     "Navigation",
-    ["🏠 Overview", "📊 Trade Reports", "📈 Analysis Log", "🎛️ Bot Control", "📋 Event Log", "🔑 API Usage"],
+    ["🏠 Overview", "📊 Trade Reports", "📈 Analysis Log", "🤖 AI Models",
+     "🎛️ Bot Control", "📋 Event Log", "🔑 API Usage"],
     label_visibility="collapsed",
 )
 
@@ -428,6 +429,120 @@ if page == "🏠 Overview":
 
     st.divider()
 
+    # ── Trading Health Score ──
+    st.markdown("### 🩺 Trading Health Score")
+    health_data = run_query(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE profit > 0) AS wins,
+            COUNT(*) FILTER (WHERE profit < 0) AS losses,
+            COALESCE(SUM(profit), 0) AS net_pnl,
+            COALESCE(AVG(profit), 0) AS avg_pnl,
+            COUNT(*) FILTER (WHERE action = 'BUY') AS buys,
+            COUNT(*) FILTER (WHERE action = 'SELL') AS sells
+        FROM trades
+        WHERE status = 'CLOSED'
+          AND closed_at >= NOW() - INTERVAL '7 days';
+        """
+    )
+    if health_data and health_data[0] and health_data[0]["total"] > 0:
+        hd = health_data[0]
+        total = int(hd["total"])
+        wins = int(hd["wins"])
+        losses = int(hd["losses"])
+        net_pnl = float(hd["net_pnl"])
+        buys = int(hd["buys"])
+        sells = int(hd["sells"])
+        win_rate = (wins / total * 100) if total > 0 else 0
+
+        # Compute composite health score (0-100)
+        # Components: win_rate (40%), profitability (30%), direction balance (30%)
+        wr_score = min(win_rate / 60 * 40, 40)  # 60% win rate = full 40 pts
+        profit_score = min(max(net_pnl / 50 * 30, 0), 30)  # $50 profit = full 30 pts
+        balance_ratio = min(buys, sells) / max(buys, sells, 1)
+        balance_score = balance_ratio * 30  # perfectly balanced = 30 pts
+        health_score = int(wr_score + profit_score + balance_score)
+
+        health_color = "#22c55e" if health_score >= 70 else ("#f59e0b" if health_score >= 40 else "#ef4444")
+        health_label = "Excellent" if health_score >= 70 else ("Fair" if health_score >= 40 else "Needs Attention")
+
+        h1, h2, h3, h4, h5 = st.columns(5)
+        h1.metric("Health Score", f"{health_score}/100")
+        h2.metric("Status", health_label)
+        h3.metric("Win Rate (7d)", f"{win_rate:.1f}%")
+        h4.metric("Net P/L (7d)", f"${net_pnl:+,.2f}")
+        buy_pct = buys / max(total, 1) * 100
+        h5.metric("BUY/SELL Ratio", f"{buys}B / {sells}S ({buy_pct:.0f}%)")
+
+        # Health bar visualization
+        st.markdown(
+            f"""<div style="background:#1e293b; border-radius:8px; padding:4px; margin:8px 0;">
+            <div style="background:{health_color}; width:{health_score}%; height:24px;
+            border-radius:6px; display:flex; align-items:center; justify-content:center;
+            font-weight:bold; color:#0f172a; font-size:0.8rem;">{health_score}%</div></div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("No closed trades in last 7 days to compute health score")
+
+    st.divider()
+
+    # ── Safety Filters Status ──
+    st.markdown("### 🛡️ Active Safety Filters")
+    bad_hours = os.getenv("BAD_HOURS_UTC", "2,3,4,5,6")
+    loss_threshold = os.getenv("LOSS_PAUSE_THRESHOLD", "3")
+    loss_pause_sec = os.getenv("LOSS_PAUSE_SEC", "1800")
+    min_hold = os.getenv("MIN_HOLD_SEC", "60")
+    max_hold = os.getenv("MAX_HOLD_SEC", "1800")
+    max_tp = os.getenv("MAX_TP_POINTS", "600")
+
+    sf1, sf2, sf3 = st.columns(3)
+    with sf1:
+        st.markdown('<div class="card-panel"><h4>⏰ Time Filter</h4>', unsafe_allow_html=True)
+        current_hour_blocked = str(now_utc.hour) in [x.strip() for x in bad_hours.split(",")]
+        if current_hour_blocked:
+            st.markdown("Status: <b class='red-accent'>BLOCKED</b> (bad hour)", unsafe_allow_html=True)
+        else:
+            st.markdown("Status: <b class='green-accent'>ACTIVE</b>", unsafe_allow_html=True)
+        st.markdown(f"<span class='text-muted'>Bad hours (UTC): {bad_hours}</span>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with sf2:
+        st.markdown('<div class="card-panel"><h4>🔴 Loss Pause</h4>', unsafe_allow_html=True)
+        # Check consecutive losses
+        recent_trades_check = run_query(
+            f"""
+            SELECT profit FROM trades
+            WHERE status = 'CLOSED'
+            ORDER BY closed_at DESC
+            LIMIT {int(loss_threshold)};
+            """
+        )
+        consec_losses = 0
+        if recent_trades_check:
+            for t in recent_trades_check:
+                if float(t["profit"] or 0) < 0:
+                    consec_losses += 1
+                else:
+                    break
+        paused = consec_losses >= int(loss_threshold)
+        if paused:
+            st.markdown(f"Status: <b class='red-accent'>PAUSED</b> ({consec_losses} consecutive losses)", unsafe_allow_html=True)
+        else:
+            st.markdown(f"Status: <b class='green-accent'>OK</b> ({consec_losses}/{loss_threshold} losses)", unsafe_allow_html=True)
+        st.markdown(f"<span class='text-muted'>Pause: {int(loss_pause_sec)//60} min after {loss_threshold} losses</span>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with sf3:
+        st.markdown('<div class="card-panel"><h4>📏 Position Limits</h4>', unsafe_allow_html=True)
+        st.markdown(f"Hold: **{min_hold}s** – **{max_hold}s**", unsafe_allow_html=True)
+        st.markdown(f"Max TP: **{max_tp} points**", unsafe_allow_html=True)
+        st.markdown("Status: <b class='green-accent'>ENFORCED</b>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.divider()
+
     # ── Active Positions ──
     st.markdown("### 📌 Active Positions")
     pos_data = mt5_api("/positions")
@@ -469,15 +584,12 @@ if page == "🏠 Overview":
     )
     if latest and latest[0]:
         ai = latest[0]
-        action_color = "#22c55e" if ai["trade_action"] == "BUY" else (
-            "#ef4444" if ai["trade_action"] == "SELL" else "#94a3b8"
-        )
         ai_col1, ai_col2, ai_col3, ai_col4 = st.columns(4)
         ai_col1.metric("Signal", ai["trade_action"])
         ai_col2.metric("Bid / Ask", f"{ai['bid']:.2f} / {ai['ask']:.2f}")
         ai_col3.metric("Lot Size", f"{ai['lot_size']}")
         ai_col4.metric("Time", ai["created_at"].strftime("%H:%M:%S") if ai["created_at"] else "N/A")
-        with st.expander("📝 Full AI Analysis", expanded=False):
+        with st.expander("Full AI Analysis", expanded=False):
             st.text(ai["ai_recommendation"] or "No recommendation")
 
     st.divider()
@@ -488,12 +600,11 @@ if page == "🏠 Overview":
     rows = run_query(
         """
         SELECT COUNT(*) as total,
-               COUNT(*) FILTER (WHERE ai_recommendation ILIKE '%%bullish%%') AS bullish,
-               COUNT(*) FILTER (WHERE ai_recommendation ILIKE '%%bearish%%') AS bearish,
-               COUNT(*) FILTER (WHERE ai_recommendation ILIKE '%%neutral%%') AS neutral,
+               COUNT(*) FILTER (WHERE trade_action = 'BUY') AS buy_signals,
+               COUNT(*) FILTER (WHERE trade_action = 'SELL') AS sell_signals,
+               COUNT(*) FILTER (WHERE trade_action = 'WAIT') AS wait_signals,
                ROUND(AVG(bid)::numeric, 2) AS avg_bid,
-               ROUND(AVG(ask)::numeric, 2) AS avg_ask,
-               ROUND(AVG(lot_size)::numeric, 2) AS avg_lot
+               ROUND(AVG(ask)::numeric, 2) AS avg_ask
         FROM ai_analysis_log
         WHERE created_at >= NOW() - INTERVAL '24 hours';
         """
@@ -502,9 +613,9 @@ if page == "🏠 Overview":
         r = rows[0]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Analyses", r["total"])
-        c2.metric("🟢 Bullish", r["bullish"])
-        c3.metric("🔴 Bearish", r["bearish"])
-        c4.metric("⚪ Neutral", r["neutral"])
+        c2.metric("🟢 BUY Signals", r["buy_signals"])
+        c3.metric("🔴 SELL Signals", r["sell_signals"])
+        c4.metric("⏸️ WAIT", r["wait_signals"])
 
     # ── Recent Trade History (last 5) ──
     st.markdown("### 📜 Recent Trades")
@@ -531,53 +642,52 @@ if page == "🏠 Overview":
     else:
         st.info("No trade history yet")
 
-    # ── Price Chart ──
-    st.markdown("### 💹 Price Chart (24h)")
-    price_rows = run_query(
-        """
-        SELECT created_at, bid, ask
-        FROM ai_analysis_log
-        WHERE created_at >= NOW() - INTERVAL '24 hours'
-        ORDER BY created_at;
-        """
-    )
-    if price_rows:
-        df = pd.DataFrame(price_rows)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df["created_at"], y=df["bid"], name="Bid",
-                                  line=dict(color="#22c55e", width=2)))
-        fig.add_trace(go.Scatter(x=df["created_at"], y=df["ask"], name="Ask",
-                                  line=dict(color="#ef4444", width=2)))
-        fig.update_layout(
-            height=400,
-            xaxis_title="Time",
-            yaxis_title="Price (USD)",
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(15,23,42,0.8)",
-            font=dict(color="#94a3b8"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No price data in last 24 hours")
-
-    # ── Sentiment Pie ──
+    # ── Signal Distribution (24h) ──
     if rows and rows[0] and rows[0]["total"] > 0:
-        st.markdown("### 🧠 Sentiment Distribution (24h)")
+        st.markdown("### 📡 Signal Distribution (24h)")
         r = rows[0]
-        fig_pie = px.pie(
-            names=["Bullish", "Bearish", "Neutral"],
-            values=[r["bullish"], r["bearish"], r["neutral"]],
-            color_discrete_sequence=["#22c55e", "#ef4444", "#64748b"],
-        )
-        fig_pie.update_layout(
-            template="plotly_dark",
-            height=350,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(15,23,42,0.8)",
-            font=dict(color="#94a3b8"),
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
+        sig_col1, sig_col2 = st.columns(2)
+        with sig_col1:
+            fig_pie = px.pie(
+                names=["BUY", "SELL", "WAIT"],
+                values=[r["buy_signals"], r["sell_signals"], r["wait_signals"]],
+                color_discrete_sequence=["#22c55e", "#ef4444", "#64748b"],
+            )
+            fig_pie.update_layout(
+                template="plotly_dark", height=300,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(15,23,42,0.8)",
+                font=dict(color="#94a3b8"),
+                title="Signal Types",
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with sig_col2:
+            # Price Chart (24h)
+            price_rows = run_query(
+                """
+                SELECT created_at, bid, ask
+                FROM ai_analysis_log
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+                ORDER BY created_at;
+                """
+            )
+            if price_rows:
+                df = pd.DataFrame(price_rows)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df["created_at"], y=df["bid"], name="Bid",
+                                          line=dict(color="#22c55e", width=2)))
+                fig.add_trace(go.Scatter(x=df["created_at"], y=df["ask"], name="Ask",
+                                          line=dict(color="#ef4444", width=2)))
+                fig.update_layout(
+                    height=300, title="Price (24h)",
+                    xaxis_title="Time", yaxis_title="Price (USD)",
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(15,23,42,0.8)",
+                    font=dict(color="#94a3b8"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
 
 # ==========================================
@@ -724,9 +834,143 @@ elif page == "📊 Trade Reports":
         m11.metric("Risk:Reward", f"1:{rr_ratio:.2f}" if rr_ratio > 0 else "N/A")
         m12.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor > 0 else "N/A")
 
-        st.caption(f"📐 Expectancy per trade: **${expectancy:+,.2f}**  |  Total Lots: **{float(s['total_lots']):.2f}**")
+        st.caption(f"Expectancy per trade: **${expectancy:+,.2f}**  |  Total Lots: **{float(s['total_lots']):.2f}**")
     else:
         st.info("No closed trades in this period")
+
+    st.divider()
+
+    # ----- BUY vs SELL Analysis -----
+    st.markdown("### ⚖️ BUY vs SELL Performance")
+    direction_stats = run_query(
+        f"""
+        SELECT
+            action,
+            COUNT(*) AS trades,
+            COUNT(*) FILTER (WHERE profit > 0) AS wins,
+            COUNT(*) FILTER (WHERE profit < 0) AS losses,
+            COALESCE(SUM(profit), 0) AS total_pnl,
+            COALESCE(AVG(profit), 0) AS avg_pnl
+        FROM trades
+        WHERE status = 'CLOSED' AND {date_filter}
+        GROUP BY action;
+        """
+    )
+    if direction_stats:
+        df_dir = pd.DataFrame(direction_stats)
+        dir_col1, dir_col2 = st.columns(2)
+        with dir_col1:
+            fig_dir_bar = go.Figure()
+            for _, row in df_dir.iterrows():
+                color = "#22c55e" if row["action"] == "BUY" else "#ef4444"
+                fig_dir_bar.add_trace(go.Bar(
+                    x=[row["action"]],
+                    y=[row["trades"]],
+                    name=row["action"],
+                    marker_color=color,
+                    text=[f"{int(row['trades'])} trades"],
+                    textposition="outside",
+                ))
+            fig_dir_bar.update_layout(
+                title="Trade Count by Direction",
+                template="plotly_dark", height=300, showlegend=False,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.8)",
+                font=dict(color="#94a3b8"),
+            )
+            st.plotly_chart(fig_dir_bar, use_container_width=True)
+
+        with dir_col2:
+            fig_dir_pnl = go.Figure()
+            for _, row in df_dir.iterrows():
+                pnl = float(row["total_pnl"])
+                color = "#22c55e" if pnl >= 0 else "#ef4444"
+                fig_dir_pnl.add_trace(go.Bar(
+                    x=[row["action"]],
+                    y=[pnl],
+                    name=row["action"],
+                    marker_color=color,
+                    text=[f"${pnl:+,.2f}"],
+                    textposition="outside",
+                ))
+            fig_dir_pnl.update_layout(
+                title="P/L by Direction",
+                template="plotly_dark", height=300, showlegend=False,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.8)",
+                font=dict(color="#94a3b8"),
+            )
+            st.plotly_chart(fig_dir_pnl, use_container_width=True)
+
+        # Direction summary table
+        st.dataframe(
+            df_dir,
+            use_container_width=True,
+            column_config={
+                "action": "Direction",
+                "trades": "# Trades",
+                "wins": "Wins",
+                "losses": "Losses",
+                "total_pnl": st.column_config.NumberColumn("Total P/L", format="$%.2f"),
+                "avg_pnl": st.column_config.NumberColumn("Avg P/L", format="$%.2f"),
+            },
+        )
+
+    st.divider()
+
+    # ----- Time-of-Day P/L Heatmap -----
+    st.markdown("### 🕐 Performance by Hour (UTC)")
+    hourly_perf = run_query(
+        """
+        SELECT
+            EXTRACT(HOUR FROM closed_at)::int AS hour,
+            COUNT(*) AS trades,
+            COALESCE(SUM(profit), 0) AS total_pnl,
+            COUNT(*) FILTER (WHERE profit > 0) AS wins,
+            COUNT(*) FILTER (WHERE profit < 0) AS losses
+        FROM trades
+        WHERE status = 'CLOSED' AND closed_at IS NOT NULL
+        GROUP BY EXTRACT(HOUR FROM closed_at)
+        ORDER BY hour;
+        """
+    )
+    if hourly_perf:
+        df_hourly = pd.DataFrame(hourly_perf)
+        hour_col1, hour_col2 = st.columns(2)
+        with hour_col1:
+            colors_h = ["#22c55e" if v >= 0 else "#ef4444" for v in df_hourly["total_pnl"]]
+            fig_h = go.Figure()
+            fig_h.add_trace(go.Bar(
+                x=df_hourly["hour"], y=df_hourly["total_pnl"],
+                marker_color=colors_h,
+                text=[f"${v:+,.1f}" for v in df_hourly["total_pnl"]],
+                textposition="outside",
+            ))
+            fig_h.update_layout(
+                title="P/L by Hour (UTC)", template="plotly_dark", height=300,
+                xaxis=dict(dtick=1, title="Hour (UTC)"), yaxis_title="P/L ($)",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.8)",
+                font=dict(color="#94a3b8"),
+            )
+            st.plotly_chart(fig_h, use_container_width=True)
+
+        with hour_col2:
+            df_hourly["win_rate"] = df_hourly.apply(
+                lambda r: (r["wins"] / r["trades"] * 100) if r["trades"] > 0 else 0, axis=1
+            )
+            fig_wr = go.Figure()
+            fig_wr.add_trace(go.Bar(
+                x=df_hourly["hour"], y=df_hourly["win_rate"],
+                marker_color=["#22c55e" if v >= 50 else "#ef4444" for v in df_hourly["win_rate"]],
+                text=[f"{v:.0f}%" for v in df_hourly["win_rate"]],
+                textposition="outside",
+            ))
+            fig_wr.add_hline(y=50, line_dash="dash", line_color="#f59e0b", opacity=0.5)
+            fig_wr.update_layout(
+                title="Win Rate by Hour (UTC)", template="plotly_dark", height=300,
+                xaxis=dict(dtick=1, title="Hour (UTC)"), yaxis_title="Win Rate %",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,23,42,0.8)",
+                font=dict(color="#94a3b8"),
+            )
+            st.plotly_chart(fig_wr, use_container_width=True)
 
     st.divider()
 
@@ -1010,6 +1254,215 @@ elif page == "📈 Analysis Log":
 
 
 # ==========================================
+# PAGE: AI MODELS
+# ==========================================
+elif page == "🤖 AI Models":
+    st.markdown("## 🤖 AI Model Management")
+    st.caption("Configure and swap AI models used by the trading bot. Changes take effect on the next analysis cycle.")
+
+    # --- Check if table exists ---
+    table_check = run_query(
+        """
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'ai_model_config'
+        ) AS exists;
+        """
+    )
+    table_exists = table_check and table_check[0]["exists"]
+
+    if not table_exists:
+        st.error("Table `ai_model_config` not found. Run `db/migrate_add_ai_model_config.sql` first.")
+        st.code(open("db/migrate_add_ai_model_config.sql").read() if os.path.exists("db/migrate_add_ai_model_config.sql") else "-- Migration file not found", language="sql")
+        st.stop()
+
+    # --- Current Active Model ---
+    st.markdown("### ⚡ Active Model")
+    active_model = run_query(
+        "SELECT * FROM ai_model_config WHERE is_active = TRUE ORDER BY updated_at DESC LIMIT 1;"
+    )
+    if active_model:
+        am = active_model[0]
+        am_col1, am_col2, am_col3, am_col4 = st.columns(4)
+        am_col1.metric("Provider", am["provider"].title())
+        am_col2.metric("Model", am["display_name"] or am["model"])
+        am_col3.metric("Max Tokens", am["max_tokens"])
+        am_col4.metric("Temperature", f"{am['temperature']}")
+        st.markdown(
+            f"""<div class="card-panel">
+            <h4>Currently Active</h4>
+            <b>Model:</b> {am['model']}<br>
+            <b>API URL:</b> {am['api_url']}<br>
+            <b>API Key:</b> {'*' * 8 + am['api_key'][-4:] if len(am['api_key']) > 4 else '***'}<br>
+            <b>Last Updated:</b> {am['updated_at'].strftime('%Y-%m-%d %H:%M') if am['updated_at'] else 'N/A'}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning("No active model configured. The bot will fall back to environment variables.")
+
+    st.divider()
+
+    # --- All Models ---
+    st.markdown("### 📋 All Configured Models")
+    all_models = run_query("SELECT * FROM ai_model_config ORDER BY is_active DESC, updated_at DESC;")
+
+    if all_models:
+        for model in all_models:
+            with st.container():
+                active_badge = "🟢 ACTIVE" if model["is_active"] else "⚪ Inactive"
+                display = model["display_name"] or model["model"]
+                st.markdown(
+                    f"""<div class="card-panel">
+                    <h4>{display} <span style="font-size:0.8rem;">{active_badge}</span></h4>
+                    <span class="text-muted">Provider: {model['provider']} | Model: {model['model']} |
+                    Tokens: {model['max_tokens']} | Temp: {model['temperature']}</span>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+                btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+                with btn_col1:
+                    if not model["is_active"]:
+                        if st.button(f"✅ Activate", key=f"activate_{model['id']}"):
+                            # Deactivate all, then activate this one
+                            run_command("UPDATE ai_model_config SET is_active = FALSE, updated_at = NOW();")
+                            run_command(
+                                "UPDATE ai_model_config SET is_active = TRUE, updated_at = NOW() WHERE id = %s;",
+                                (model["id"],),
+                            )
+                            run_command(
+                                "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
+                                ("CONFIG_CHANGE", f"AI model switched to {model['provider']}/{model['model']}"),
+                            )
+                            st.success(f"Activated: {display}")
+                            st.rerun()
+
+                with btn_col2:
+                    if st.button(f"🧪 Test", key=f"test_{model['id']}"):
+                        st.info(f"Testing connection to {model['provider']}...")
+                        try:
+                            headers = {
+                                "Authorization": f"Bearer {model['api_key']}",
+                                "Content-Type": "application/json",
+                            }
+                            payload = {
+                                "model": model["model"],
+                                "messages": [{"role": "user", "content": "Say OK"}],
+                                "max_tokens": 10,
+                                "temperature": 0.1,
+                            }
+                            resp = req_lib.post(
+                                model["api_url"],
+                                headers=headers,
+                                json=payload,
+                                timeout=15,
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                reply = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                st.success(f"Connection OK! Response: {reply[:100]}")
+                            else:
+                                st.error(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                        except Exception as e:
+                            st.error(f"Connection failed: {e}")
+
+                with btn_col3:
+                    if st.button(f"🗑️ Delete", key=f"delete_{model['id']}"):
+                        if model["is_active"]:
+                            st.error("Cannot delete the active model. Activate another model first.")
+                        else:
+                            run_command("DELETE FROM ai_model_config WHERE id = %s;", (model["id"],))
+                            st.success(f"Deleted: {display}")
+                            st.rerun()
+    else:
+        st.info("No models configured yet. Add one below.")
+
+    st.divider()
+
+    # --- Edit Existing Model ---
+    st.markdown("### ✏️ Edit Model")
+    if all_models:
+        model_options = {f"{m['display_name'] or m['model']} ({m['provider']})": m for m in all_models}
+        selected_name = st.selectbox("Select model to edit", list(model_options.keys()))
+        sel = model_options[selected_name]
+
+        with st.form("edit_model_form"):
+            edit_display = st.text_input("Display Name", value=sel["display_name"] or "")
+            edit_provider = st.selectbox(
+                "Provider",
+                ["nvidia", "openrouter"],
+                index=0 if sel["provider"] == "nvidia" else 1,
+            )
+            edit_model = st.text_input("Model ID", value=sel["model"])
+            edit_url = st.text_input("API URL", value=sel["api_url"])
+            edit_key = st.text_input("API Key", value=sel["api_key"], type="password")
+            edit_tokens = st.number_input("Max Tokens", 50, 4096, int(sel["max_tokens"]))
+            edit_temp = st.number_input("Temperature", 0.0, 2.0, float(sel["temperature"]), step=0.05)
+            edit_notes = st.text_area("Notes", value=sel.get("notes") or "")
+
+            if st.form_submit_button("💾 Save Changes"):
+                run_command(
+                    """
+                    UPDATE ai_model_config
+                    SET display_name = %s, provider = %s, model = %s,
+                        api_url = %s, api_key = %s, max_tokens = %s,
+                        temperature = %s, notes = %s, updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (edit_display, edit_provider, edit_model, edit_url, edit_key,
+                     edit_tokens, edit_temp, edit_notes, sel["id"]),
+                )
+                st.success(f"Updated: {edit_display or edit_model}")
+                st.rerun()
+
+    st.divider()
+
+    # --- Add New Model ---
+    st.markdown("### ➕ Add New Model")
+    with st.form("add_model_form"):
+        new_display = st.text_input("Display Name", placeholder="e.g. GPT-4o (OpenRouter)")
+        new_provider = st.selectbox("Provider", ["nvidia", "openrouter"], key="new_provider")
+        new_model = st.text_input("Model ID", placeholder="e.g. meta/llama-3.1-70b-instruct")
+        new_url = st.text_input("API URL", placeholder="https://...")
+        new_key = st.text_input("API Key", type="password")
+        new_tokens = st.number_input("Max Tokens", 50, 4096, 400, key="new_tokens")
+        new_temp = st.number_input("Temperature", 0.0, 2.0, 0.10, step=0.05, key="new_temp")
+        new_notes = st.text_area("Notes", key="new_notes")
+
+        if st.form_submit_button("➕ Add Model"):
+            if new_model and new_url and new_key:
+                run_command(
+                    """
+                    INSERT INTO ai_model_config
+                        (provider, model, api_key, api_url, is_active, display_name,
+                         max_tokens, temperature, notes)
+                    VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s);
+                    """,
+                    (new_provider, new_model, new_key, new_url,
+                     new_display or new_model, new_tokens, new_temp, new_notes),
+                )
+                st.success(f"Added: {new_display or new_model}")
+                st.rerun()
+            else:
+                st.error("Model ID, API URL, and API Key are required.")
+
+    st.divider()
+
+    # --- Fallback Info ---
+    st.markdown("### ℹ️ Fallback Configuration")
+    st.markdown(
+        """
+        If no active model is found in the database, the bot falls back to environment variables:
+        - `AI_PROVIDER` (nvidia/openrouter)
+        - `NVIDIA_API_KEY`, `NVIDIA_URL`, `NVIDIA_MODEL`
+        - `OPENROUTER_API_KEY`, `OPENROUTER_URL`, `MODEL`
+        """
+    )
+
+
+# ==========================================
 # PAGE: BOT CONTROL
 # ==========================================
 elif page == "🎛️ Bot Control":
@@ -1081,7 +1534,7 @@ elif page == "🎛️ Bot Control":
     # --- Settings ---
     st.markdown("### ⚙️ Configuration")
 
-    # ดึงค่าปัจจุบัน (รองรับ column ใหม่)
+    # Get current values (support new columns)
     current_max_retries = s.get("pause_max_retries", 5)
     current_retry_sec = s.get("pause_retry_sec", 10)
 
@@ -1498,17 +1951,25 @@ elif page == "🔑 API Usage":
 # ==========================================
 st.sidebar.divider()
 
-# Show AI provider info
-ai_provider = os.getenv("AI_PROVIDER", "openrouter").lower()
-if ai_provider == "nvidia":
-    ai_model = os.getenv("NVIDIA_MODEL", "N/A")
+# Show active AI model from DB or env fallback
+_active_ai = run_query(
+    "SELECT provider, model, display_name FROM ai_model_config WHERE is_active = TRUE LIMIT 1;"
+) if run_query(
+    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'ai_model_config') AS e;"
+)[0]["e"] else None
+
+if _active_ai and _active_ai[0]:
+    _ai_prov = _active_ai[0]["provider"]
+    _ai_model = _active_ai[0]["display_name"] or _active_ai[0]["model"]
 else:
-    ai_model = os.getenv("MODEL", "N/A")
+    _ai_prov = os.getenv("AI_PROVIDER", "openrouter").lower()
+    _ai_model = os.getenv("NVIDIA_MODEL", "N/A") if _ai_prov == "nvidia" else os.getenv("MODEL", "N/A")
+
 st.sidebar.markdown(f"""
 <div class="text-muted">
-<b class="gold-accent">Engine:</b> {ai_model}<br>
+<b class="gold-accent">Engine:</b> {_ai_model}<br>
 <b class="gold-accent">Symbol:</b> XAUUSD<br>
-<b class="gold-accent">Provider:</b> {ai_provider.title()}
+<b class="gold-accent">Provider:</b> {_ai_prov.title()}
 </div>
 """, unsafe_allow_html=True)
-st.sidebar.caption(f"AI Gold Trader v2.0 Enterprise • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.sidebar.caption(f"AI Gold Trader v2.1 Enterprise • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
