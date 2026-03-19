@@ -75,6 +75,7 @@ jupyter_notebook_config.py
 
 # Environments
 .env
+.env.*
 .venv
 env/
 venv/
