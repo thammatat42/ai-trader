@@ -135,10 +135,11 @@ def calculate_lot_size(atr_value: float | None = None) -> dict:
     default_sl = float(os.getenv("SL_POINTS", 300))
     default_tp = float(os.getenv("TP_POINTS", 600))
     atr_sl_multiplier = float(os.getenv("ATR_SL_MULTIPLIER", 1.5))
-    atr_tp_multiplier = float(os.getenv("ATR_TP_MULTIPLIER", 2.5))
-    min_sl = float(os.getenv("MIN_SL_POINTS", 100))
-    max_sl = float(os.getenv("MAX_SL_POINTS", 500))
-    max_tp = float(os.getenv("MAX_TP_POINTS", 600))
+    atr_tp_multiplier = float(os.getenv("ATR_TP_MULTIPLIER", 2.0))
+    min_sl = float(os.getenv("MIN_SL_POINTS", 150))
+    max_sl = float(os.getenv("MAX_SL_POINTS", 400))
+    min_tp = float(os.getenv("MIN_TP_POINTS", 250))
+    max_tp = float(os.getenv("MAX_TP_POINTS", 500))
     # FIX #4: explicit point-value constant — for XAUUSD: $1 per point per standard lot
     point_value_per_lot = float(os.getenv("POINT_VALUE_PER_LOT", 1.0))
 
@@ -148,10 +149,13 @@ def calculate_lot_size(atr_value: float | None = None) -> dict:
         sl_points = round(atr_points * atr_sl_multiplier)
         tp_points = round(atr_points * atr_tp_multiplier)
         sl_points = max(min_sl, min(max_sl, sl_points))
-        tp_points = max(sl_points * 1.5, tp_points)
-        tp_points = min(tp_points, max_tp)
+        # Enforce realistic TP: 1.5x to 2.5x SL — must be ACHIEVABLE
+        tp_points = max(min_tp, min(max_tp, tp_points))
+        # Ensure minimum 1.5:1 R:R but cap at 2.5:1 to keep TP reachable
         if tp_points < sl_points * 1.5:
             tp_points = round(sl_points * 1.5)
+        if tp_points > sl_points * 2.5:
+            tp_points = round(sl_points * 2.5)
         sl_src = "ATR"
     else:
         sl_points = default_sl
@@ -745,6 +749,578 @@ def journal_detect_patterns():
 
 
 # ==========================================
+# 2.4.1  RAG CONTEXT SYSTEM (Self-Learning)
+#         Inspired by Polymarket agent's 10-section context
+# ==========================================
+
+def build_rag_context() -> str:
+    """
+    Build comprehensive self-learning context for AI (like Polymarket's 10-section RAG).
+    Sections: Performance, Confidence Calibration, Direction Analysis,
+    Streak, Lessons from Losses, Time-of-Day, Signal Reliability.
+    """
+    sections = []
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # --- Section 1: Overall Performance (last 3 days) ---
+        cur.execute("""
+            SELECT COUNT(*) FILTER (WHERE profit > 0) as wins,
+                   COUNT(*) FILTER (WHERE profit <= 0) as losses,
+                   COUNT(*) as total,
+                   COALESCE(SUM(profit), 0) as total_profit,
+                   COALESCE(AVG(CASE WHEN profit > 0 THEN profit END), 0) as avg_win,
+                   COALESCE(AVG(CASE WHEN profit <= 0 THEN profit END), 0) as avg_loss
+            FROM trades
+            WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '3 days';
+        """)
+        row = cur.fetchone()
+        if row and row[2] > 0:
+            wins, losses, total, total_pnl, avg_w, avg_l = row
+            wr = round(wins / total * 100, 1) if total > 0 else 0
+            rr = round(abs(float(avg_w) / float(avg_l)), 2) if avg_l and float(avg_l) != 0 else 0
+            sections.append(
+                f"=== YOUR PERFORMANCE (3 days) ===\n"
+                f"Record: {wins}W/{losses}L ({wr}% WR) | Net P/L: ${float(total_pnl):+.2f}\n"
+                f"Avg Win: ${float(avg_w):.2f} | Avg Loss: ${float(avg_l):.2f} | R:R = 1:{rr}\n"
+                f"{'⚠️ LOSING MONEY — be MORE selective, only high-confidence setups' if float(total_pnl) < 0 else '✅ Profitable — maintain discipline'}\n"
+                f"{'⚠️ Avg loss > Avg win — let winners RUN longer, cut losers FASTER' if abs(float(avg_l)) > abs(float(avg_w)) else ''}"
+            )
+
+        # --- Section 2: Confidence Calibration ---
+        cur.execute("""
+            SELECT ai_confidence, COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE profit > 0) as wins,
+                   ROUND(COUNT(*) FILTER (WHERE profit > 0)::numeric / NULLIF(COUNT(*), 0) * 100, 1) as wr
+            FROM trades
+            WHERE status = 'CLOSED' AND ai_confidence IS NOT NULL
+                  AND closed_at >= NOW() - INTERVAL '7 days'
+            GROUP BY ai_confidence
+            ORDER BY ai_confidence;
+        """)
+        cal_rows = cur.fetchall()
+        if cal_rows:
+            cal_lines = ["=== CONFIDENCE CALIBRATION (your conf vs actual WR) ==="]
+            for cr in cal_rows:
+                conf, cnt, ws, actual_wr = cr
+                if cnt >= 2:
+                    marker = "✅" if float(actual_wr or 0) >= 55 else "⚠️" if float(actual_wr or 0) >= 40 else "❌"
+                    overconf = ""
+                    if conf and conf >= 8 and float(actual_wr or 0) < 50:
+                        overconf = " ← OVERCONFIDENT! High conf but losing"
+                    if conf and conf <= 5 and float(actual_wr or 0) > 60:
+                        overconf = " ← UNDERVALUED! Low conf but winning"
+                    cal_lines.append(f"  Conf {conf}: {cnt} trades, {actual_wr}% actual WR {marker}{overconf}")
+            if len(cal_lines) > 1:
+                sections.append("\n".join(cal_lines))
+
+        # --- Section 3: Direction Analysis ---
+        cur.execute("""
+            SELECT action,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE profit > 0) as wins,
+                   COALESCE(SUM(profit), 0) as pnl
+            FROM trades
+            WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '3 days'
+            GROUP BY action;
+        """)
+        dir_rows = cur.fetchall()
+        if dir_rows:
+            total_all = sum(r[1] for r in dir_rows)
+            dir_lines = ["=== DIRECTION ANALYSIS ==="]
+            for dr in dir_rows:
+                act, cnt, ws, pnl = dr
+                wr = round(ws / cnt * 100, 1) if cnt > 0 else 0
+                pct = round(cnt / total_all * 100, 0) if total_all > 0 else 0
+                bias_warn = ""
+                if pct > 70:
+                    bias_warn = f" ⚠️ HEAVY {act} BIAS ({pct:.0f}%) — actively seek {'SELL' if act == 'BUY' else 'BUY'} setups!"
+                dir_lines.append(f"  {act}: {cnt} trades ({pct:.0f}%), WR={wr}%, P/L=${float(pnl):+.2f}{bias_warn}")
+            sections.append("\n".join(dir_lines))
+
+        # --- Section 4: Streak Analysis ---
+        cur.execute("""
+            SELECT profit FROM trades
+            WHERE status = 'CLOSED' AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC LIMIT 20;
+        """)
+        streak_rows = cur.fetchall()
+        if streak_rows:
+            results = ["W" if float(r[0] or 0) > 0 else "L" for r in streak_rows]
+            pattern = "".join(results[:15])
+
+            # Current streak
+            current_streak = 1
+            streak_type = results[0]
+            for i in range(1, len(results)):
+                if results[i] == streak_type:
+                    current_streak += 1
+                else:
+                    break
+
+            streak_text = f"=== STREAK ANALYSIS ===\n"
+            streak_text += f"Current: {current_streak} {'WIN' if streak_type == 'W' else 'LOSS'}s in a row\n"
+            streak_text += f"Pattern (newest→oldest): {pattern}"
+            if current_streak >= 3 and streak_type == "L":
+                streak_text += f"\n⚠️ {current_streak} consecutive LOSSES — require confidence 8+ and strongest confluence"
+            if current_streak >= 4 and streak_type == "W":
+                streak_text += f"\n⚠️ {current_streak} WIN streak — stay disciplined, don't get overconfident"
+            sections.append(streak_text)
+
+        # --- Section 5: Lessons from Recent Losses ---
+        cur.execute("""
+            SELECT action, open_price, close_price, profit, sl_price, tp_price,
+                   ai_confidence, market_regime, trend_direction,
+                   EXTRACT(EPOCH FROM (closed_at - opened_at)) as hold_sec
+            FROM trades
+            WHERE status = 'CLOSED' AND profit < 0
+                  AND closed_at >= NOW() - INTERVAL '2 days'
+            ORDER BY closed_at DESC LIMIT 5;
+        """)
+        loss_rows = cur.fetchall()
+        if loss_rows:
+            loss_lines = ["=== LESSONS FROM RECENT LOSSES ==="]
+            sl_hit_count = 0
+            quick_loss_count = 0
+            counter_trend_count = 0
+            for lr in loss_rows:
+                act, op, cp, pft, sl, tp, conf, regime, trend, hold = lr
+                hold = int(hold) if hold else 0
+                # Detect if SL was hit
+                if sl and cp:
+                    if act == "BUY" and float(cp) <= float(sl) + 0.1:
+                        sl_hit_count += 1
+                    elif act == "SELL" and float(cp) >= float(sl) - 0.1:
+                        sl_hit_count += 1
+                if hold < 60:
+                    quick_loss_count += 1
+                if trend and act != trend:
+                    counter_trend_count += 1
+                loss_lines.append(
+                    f"  {act} P/L=${float(pft):.2f} | Hold={hold}s | Conf={conf} | Regime={regime} | Trend={trend}"
+                )
+            if sl_hit_count >= 2:
+                loss_lines.append(f"  PATTERN: {sl_hit_count}/{len(loss_rows)} losses hit SL — entries may be late or SL too tight")
+            if quick_loss_count >= 2:
+                loss_lines.append(f"  PATTERN: {quick_loss_count}/{len(loss_rows)} losses < 60s — entering into reversals")
+            if counter_trend_count >= 2:
+                loss_lines.append(f"  PATTERN: {counter_trend_count}/{len(loss_rows)} losses were COUNTER-TREND — trade WITH the trend!")
+            sections.append("\n".join(loss_lines))
+
+        # --- Section 6: Time-of-Day Performance ---
+        cur.execute("""
+            SELECT EXTRACT(HOUR FROM opened_at) as hour,
+                   COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE profit > 0) as wins,
+                   COALESCE(SUM(profit), 0) as pnl
+            FROM trades
+            WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '7 days'
+            GROUP BY EXTRACT(HOUR FROM opened_at)
+            HAVING COUNT(*) >= 3
+            ORDER BY pnl DESC;
+        """)
+        hour_rows = cur.fetchall()
+        if hour_rows:
+            hour_lines = ["=== TIME-OF-DAY PERFORMANCE ==="]
+            for hr in hour_rows:
+                h, cnt, ws, pnl = hr
+                wr = round(ws / cnt * 100, 0) if cnt > 0 else 0
+                marker = "🟢" if float(pnl) > 0 else "🔴"
+                hour_lines.append(f"  {marker} {int(h):02d}:00 UTC: {cnt} trades, {wr}% WR, ${float(pnl):+.2f}")
+            sections.append("\n".join(hour_lines))
+
+        # --- Section 7: Signal Reliability ---
+        cur.execute("""
+            SELECT signal_name, times_correct, times_wrong, reliability_pct
+            FROM signal_reliability
+            WHERE (times_correct + times_wrong) >= 3
+            ORDER BY reliability_pct DESC;
+        """)
+        sig_rows = cur.fetchall()
+        if sig_rows:
+            sig_lines = ["=== SIGNAL RELIABILITY (from post-trade analysis) ==="]
+            for sr in sig_rows:
+                name, correct, wrong, rel = sr
+                total_s = correct + wrong
+                marker = "✅" if float(rel) >= 60 else "⚠️" if float(rel) >= 45 else "❌"
+                sig_lines.append(f"  {marker} {name}: {float(rel):.0f}% reliable ({correct}/{total_s})")
+            sections.append("\n".join(sig_lines))
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"[RAG] ⚠️ Error building RAG context: {e}")
+
+    return "\n\n".join(sections) if sections else ""
+
+
+# ==========================================
+# 2.4.2  POST-TRADE ANALYSIS (AI Reviews Each Closed Trade)
+# ==========================================
+
+def analyze_closed_trade(trade_row: dict) -> dict | None:
+    """
+    After a trade closes, AI analyzes what went right/wrong.
+    Returns: {correct_signals, wrong_signals, key_factor, lesson, confidence_justified}
+    Inspired by Polymarket's resolver.py post-resolve analysis.
+    """
+    ai_cfg = _get_ai_config("main")
+    api_key = ai_cfg["api_key"]
+    if not api_key:
+        return None
+
+    action = trade_row.get("action", "")
+    open_p = trade_row.get("open_price", 0)
+    close_p = trade_row.get("close_price", 0)
+    profit = float(trade_row.get("profit", 0))
+    sl = trade_row.get("sl_price", 0)
+    tp = trade_row.get("tp_price", 0)
+    conf = trade_row.get("ai_confidence", "?")
+    regime = trade_row.get("market_regime", "unknown")
+    trend = trade_row.get("trend_direction", "unknown")
+    hold_sec = trade_row.get("hold_sec", 0)
+    outcome = "WIN" if profit > 0 else "LOSS"
+
+    prompt = (
+        f"Analyze this completed XAUUSD trade:\n"
+        f"Action: {action} | Open: {open_p} | Close: {close_p} | P/L: ${profit:+.2f} ({outcome})\n"
+        f"SL: {sl} | TP: {tp} | AI Confidence: {conf} | Hold: {hold_sec}s\n"
+        f"Market Regime: {regime} | Trend Direction: {trend}\n\n"
+        f"Analyze which signals/factors were CORRECT vs WRONG for this trade.\n"
+        f"Reply in this exact JSON format (no other text):\n"
+        f'{{"correct_signals": ["signal1", "signal2"], '
+        f'"wrong_signals": ["signal3"], '
+        f'"key_factor": "one sentence about the main reason for the outcome", '
+        f'"lesson": "one sentence lesson to avoid this mistake / replicate this success", '
+        f'"confidence_justified": true/false}}'
+    )
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": ai_cfg["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 200,
+        "temperature": 0.05,
+    }
+
+    try:
+        resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        reply = resp.json()["choices"][0]["message"]["content"].strip()
+
+        # Parse JSON from response
+        json_match = re.search(r'\{.*\}', reply, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            return result
+    except Exception as e:
+        print(f"[POST-ANALYSIS] ⚠️ Failed: {e}")
+
+    return None
+
+
+def process_recently_closed_trades():
+    """
+    Find trades that closed but haven't been analyzed yet.
+    Run post-trade AI analysis and update signal reliability + confidence calibration.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Find closed trades not yet analyzed (last 24h)
+        cur.execute("""
+            SELECT t.id, t.order_id, t.action, t.open_price, t.close_price,
+                   t.profit, t.sl_price, t.tp_price, t.ai_confidence,
+                   t.market_regime, t.trend_direction,
+                   EXTRACT(EPOCH FROM (t.closed_at - t.opened_at)) as hold_sec
+            FROM trades t
+            LEFT JOIN trade_analysis ta ON t.order_id = ta.order_id
+            WHERE t.status = 'CLOSED' AND t.closed_at IS NOT NULL
+                  AND t.closed_at >= NOW() - INTERVAL '24 hours'
+                  AND ta.id IS NULL
+            ORDER BY t.closed_at DESC
+            LIMIT 3;
+        """)
+        rows = cur.fetchall()
+
+        for row in rows:
+            trade_data = {
+                "id": row[0], "order_id": row[1], "action": row[2],
+                "open_price": row[3], "close_price": row[4], "profit": row[5],
+                "sl_price": row[6], "tp_price": row[7], "ai_confidence": row[8],
+                "market_regime": row[9], "trend_direction": row[10],
+                "hold_sec": int(row[11]) if row[11] else 0,
+            }
+            profit = float(row[5] or 0)
+            outcome = "WIN" if profit > 0 else "LOSS"
+
+            analysis = analyze_closed_trade(trade_data)
+            if not analysis:
+                continue
+
+            # Save analysis to DB
+            cur.execute("""
+                INSERT INTO trade_analysis
+                    (trade_id, order_id, outcome, profit, analysis_json,
+                     correct_signals, wrong_signals, key_factor, lesson, confidence_justified)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING;
+            """, (
+                trade_data["id"], trade_data["order_id"], outcome, profit,
+                json.dumps(analysis),
+                analysis.get("correct_signals", []),
+                analysis.get("wrong_signals", []),
+                analysis.get("key_factor", ""),
+                analysis.get("lesson", ""),
+                analysis.get("confidence_justified", False),
+            ))
+
+            # Update signal reliability
+            for sig in analysis.get("correct_signals", []):
+                sig_name = sig.strip()
+                cur.execute("""
+                    UPDATE signal_reliability
+                    SET times_correct = times_correct + 1,
+                        reliability_pct = ROUND((times_correct + 1)::numeric / NULLIF(times_correct + 1 + times_wrong, 0) * 100, 1),
+                        updated_at = NOW()
+                    WHERE signal_name = %s;
+                """, (sig_name,))
+            for sig in analysis.get("wrong_signals", []):
+                sig_name = sig.strip()
+                cur.execute("""
+                    UPDATE signal_reliability
+                    SET times_wrong = times_wrong + 1,
+                        reliability_pct = ROUND(times_correct::numeric / NULLIF(times_correct + times_wrong + 1, 0) * 100, 1),
+                        updated_at = NOW()
+                    WHERE signal_name = %s;
+                """, (sig_name,))
+
+            # Update confidence calibration
+            conf_level = trade_data.get("ai_confidence")
+            if conf_level and 1 <= conf_level <= 10:
+                cur.execute("""
+                    UPDATE confidence_calibration
+                    SET total_trades = total_trades + 1,
+                        wins = wins + CASE WHEN %s = 'WIN' THEN 1 ELSE 0 END,
+                        actual_win_rate = ROUND(
+                            (wins + CASE WHEN %s = 'WIN' THEN 1 ELSE 0 END)::numeric /
+                            NULLIF(total_trades + 1, 0) * 100, 1
+                        ),
+                        avg_profit = ROUND(
+                            (avg_profit * total_trades + %s) / (total_trades + 1), 2
+                        ),
+                        updated_at = NOW()
+                    WHERE confidence_level = %s;
+                """, (outcome, outcome, profit, conf_level))
+
+            print(f"[POST-ANALYSIS] 📊 #{trade_data['order_id']} {outcome}: "
+                  f"correct={analysis.get('correct_signals', [])}, "
+                  f"lesson={analysis.get('lesson', 'N/A')[:60]}")
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"[POST-ANALYSIS] ⚠️ Error: {e}")
+
+
+def get_auto_generated_lessons() -> str:
+    """
+    Generate data-driven lessons from trade history (like Polymarket's Research Loop).
+    These are injected into the AI prompt to prevent repeating mistakes.
+    """
+    lessons = []
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Lesson 1: If avg loss > avg win = R:R problem
+        cur.execute("""
+            SELECT COALESCE(AVG(CASE WHEN profit > 0 THEN profit END), 0),
+                   COALESCE(AVG(CASE WHEN profit <= 0 THEN profit END), 0)
+            FROM trades WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '3 days';
+        """)
+        row = cur.fetchone()
+        if row and row[0] and row[1]:
+            avg_w, avg_l = float(row[0]), float(row[1])
+            if abs(avg_l) > abs(avg_w) * 1.3:
+                lessons.append(
+                    f"DATA: Avg loss (${avg_l:.2f}) is much bigger than avg win (${avg_w:.2f}). "
+                    f"LESSON: Let winning trades RUN longer. Don't take quick small profits."
+                )
+
+        # Lesson 2: Direction that's losing money
+        cur.execute("""
+            SELECT action, SUM(profit), COUNT(*)
+            FROM trades WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '3 days'
+            GROUP BY action;
+        """)
+        for dr in cur.fetchall():
+            act, pnl, cnt = dr
+            if float(pnl) < -5 and cnt >= 3:
+                lessons.append(
+                    f"DATA: {act} trades lost ${abs(float(pnl)):.2f} in 3 days ({cnt} trades). "
+                    f"LESSON: Reduce {act} frequency. Only {act} with confidence 8+ and strong trend alignment."
+                )
+
+        # Lesson 3: Time-of-day losses
+        cur.execute("""
+            SELECT EXTRACT(HOUR FROM opened_at)::int as h, SUM(profit), COUNT(*)
+            FROM trades WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '5 days'
+            GROUP BY h HAVING SUM(profit) < -3 AND COUNT(*) >= 3
+            ORDER BY SUM(profit) ASC LIMIT 3;
+        """)
+        bad_hours = cur.fetchall()
+        if bad_hours:
+            hours_str = ", ".join(f"{int(h[0]):02d}:00" for h in bad_hours)
+            lessons.append(f"DATA: Worst performing hours: {hours_str} UTC. LESSON: Avoid trading during these hours if possible.")
+
+        # Lesson 4: Counter-trend trades losing
+        cur.execute("""
+            SELECT COUNT(*) FILTER (WHERE profit < 0 AND action != trend_direction) as counter_losses,
+                   COUNT(*) FILTER (WHERE profit > 0 AND action = trend_direction) as with_trend_wins,
+                   COUNT(*) FILTER (WHERE trend_direction IS NOT NULL) as total_with_trend
+            FROM trades WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '3 days';
+        """)
+        row = cur.fetchone()
+        if row and row[2] and row[2] >= 5:
+            counter_l = row[0] or 0
+            with_trend_w = row[1] or 0
+            if counter_l >= 3:
+                lessons.append(
+                    f"DATA: {counter_l} counter-trend trades lost money vs {with_trend_w} with-trend wins. "
+                    f"LESSON: ALWAYS trade with H1+H4 trend. Counter-trend needs confidence 9+."
+                )
+
+        # Lesson 5: Recent trade_analysis lessons (from post-trade AI)
+        cur.execute("""
+            SELECT lesson FROM trade_analysis
+            WHERE created_at >= NOW() - INTERVAL '2 days'
+            ORDER BY created_at DESC LIMIT 3;
+        """)
+        ai_lessons = cur.fetchall()
+        for al in ai_lessons:
+            if al[0]:
+                lessons.append(f"AI POST-TRADE: {al[0]}")
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[LESSONS] ⚠️ Error: {e}")
+
+    if lessons:
+        return "=== AUTO-GENERATED LESSONS (from your actual trade data) ===\n" + "\n".join(f"• {l}" for l in lessons)
+    return ""
+
+
+# ==========================================
+# 2.4.3  DAILY LOSS CIRCUIT BREAKER
+# ==========================================
+
+def check_daily_loss_limit() -> tuple[bool, str]:
+    """
+    Hard daily loss limit — stops ALL trading if daily losses exceed threshold.
+    Like Polymarket's circuit breaker: daily loss >= $X → stop for the day.
+    """
+    daily_limit = float(os.getenv("DAILY_LOSS_LIMIT", 10.0))
+    if daily_limit <= 0:
+        return True, "Daily loss limit disabled"
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COALESCE(SUM(profit), 0)
+            FROM trades
+            WHERE status = 'CLOSED' AND opened_at >= CURRENT_DATE;
+        """)
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        today_pnl = float(row[0]) if row else 0
+        if today_pnl <= -daily_limit:
+            msg = f"Daily loss limit hit: ${today_pnl:.2f} <= -${daily_limit:.2f}"
+            return False, msg
+        return True, f"Daily P/L: ${today_pnl:+.2f} (limit: -${daily_limit:.2f})"
+    except Exception as e:
+        print(f"[CIRCUIT] ⚠️ Error checking daily loss: {e}")
+        return True, "Error checking daily loss"
+
+
+def update_daily_performance():
+    """Update daily_performance table with today's stats."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO daily_performance (trade_date, total_trades, wins, losses,
+                total_profit, buy_count, sell_count, avg_hold_sec, avg_win, avg_loss)
+            SELECT
+                CURRENT_DATE,
+                COUNT(*),
+                COUNT(*) FILTER (WHERE profit > 0),
+                COUNT(*) FILTER (WHERE profit <= 0),
+                COALESCE(SUM(profit), 0),
+                COUNT(*) FILTER (WHERE action = 'BUY'),
+                COUNT(*) FILTER (WHERE action = 'SELL'),
+                COALESCE(AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)))::int, 0),
+                COALESCE(AVG(CASE WHEN profit > 0 THEN profit END), 0),
+                COALESCE(AVG(CASE WHEN profit <= 0 THEN profit END), 0)
+            FROM trades
+            WHERE status = 'CLOSED' AND opened_at >= CURRENT_DATE
+            ON CONFLICT (trade_date) DO UPDATE SET
+                total_trades = EXCLUDED.total_trades,
+                wins = EXCLUDED.wins,
+                losses = EXCLUDED.losses,
+                total_profit = EXCLUDED.total_profit,
+                buy_count = EXCLUDED.buy_count,
+                sell_count = EXCLUDED.sell_count,
+                avg_hold_sec = EXCLUDED.avg_hold_sec,
+                avg_win = EXCLUDED.avg_win,
+                avg_loss = EXCLUDED.avg_loss,
+                updated_at = NOW();
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[DAILY] ⚠️ Error updating daily performance: {e}")
+
+
+def save_trade_with_context(order_id, symbol, action, lot, open_price,
+                            sl_price, tp_price, ai_confidence=None,
+                            market_regime=None, trend_direction=None, trend_strength=None):
+    """Enhanced save_trade_to_db that also stores AI context for post-trade analysis."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trades (order_id, symbol, action, lot, open_price,
+                                sl_price, tp_price, status, opened_at,
+                                ai_confidence, ai_sentiment, market_regime,
+                                trend_direction, trend_strength)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN', NOW(), %s, %s, %s, %s, %s)
+            ON CONFLICT (order_id) DO NOTHING;
+            """,
+            (order_id, symbol, action, lot, open_price, sl_price, tp_price,
+             ai_confidence, action, market_regime, trend_direction, trend_strength),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[DB] 📝 Trade #{order_id} saved (OPEN) conf={ai_confidence} regime={market_regime} trend={trend_direction}")
+    except Exception as e:
+        print(f"[ERROR] save_trade_with_context: {e}")
+
+
+# ==========================================
 # 2.5  PARSE AI SENTIMENT
 # ==========================================
 def _extract_confidence(ai_text: str) -> int:
@@ -775,7 +1351,7 @@ def parse_sentiment(ai_text: str) -> str:
     New parser reads ONLY the "Sentiment:" line (structured output).
     Falls back to keyword search on first 2 lines only if structured line missing.
     """
-    min_confidence = int(os.getenv("MIN_CONFIDENCE", 5))
+    min_confidence = int(os.getenv("MIN_CONFIDENCE", 7))
     confidence     = _extract_confidence(ai_text)
     sentiment      = "WAIT"
 
@@ -1114,38 +1690,55 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         f"You analyze multi-timeframe data ({stf}, H1, H4, D1) using technical indicators, "
         "price action, order flow, and macro events.\n\n"
 
-        "TRADING STYLE: Short-term scalping (3-30 min hold). "
-        "You are BALANCED — you trade both BUY and SELL with equal discipline.\n\n"
+        "TRADING STYLE: Short-term scalping (5-15 min hold, target $2-$5 profit per 0.01 lot). "
+        "You are BALANCED — you trade both BUY and SELL with equal discipline. "
+        "QUALITY over QUANTITY: Only take HIGH-PROBABILITY setups. "
+        "It is better to WAIT and miss a trade than to enter a bad one.\n\n"
+
+        "PROFIT-FOCUSED RULES (most important):\n"
+        "1. Trading is for PROFIT, not just winning. A small win that gets stopped out is worse than waiting.\n"
+        "2. Only enter when price has ROOM TO MOVE: at least $2-$3 to the next S/R level in your direction.\n"
+        "3. Entry timing matters: Enter on pullbacks to EMA/support, NOT after price already moved $2+ in your direction.\n"
+        "4. If price is mid-range between support and resistance with no momentum → WAIT.\n"
+        "5. NEVER chase a move that already happened. If price just spiked $3-$5, wait for a pullback.\n\n"
 
         "CRITICAL RULES:\n"
-        "1. Analyze BOTH directions equally. Do NOT default to BUY.\n"
+        "1. Analyze BOTH directions equally. Do NOT default to SELL. Check your recent trade log — "
+        "if >70%% are SELL, actively look for BUY setups. Direction bias destroys accounts.\n"
         "2. TREND IS KING: Always check H1+H4 trend alignment FIRST. "
         "Trading WITH the multi-TF trend has 70%+ base probability. "
         "Counter-trend trades need overwhelming evidence (confidence 8+).\n"
         "3. Support/Resistance proximity: Do NOT BUY near resistance or SELL near support "
         "unless a breakout is confirmed by volume + momentum.\n"
         "4. Consider the FULL picture: technicals + trade history + news + patterns. "
-        "Do not base decisions on a single indicator.\n\n"
+        "Do not base decisions on a single indicator.\n"
+        "5. WAIT is your best friend. If you are unsure, WAIT. "
+        "Only trade when you see a clear, high-confidence setup with 4+ aligned signals.\n\n"
 
-        "DECISION RULES (need 3+ signals aligned):\n"
-        "BUY: EMA9>EMA21 on H1+H4 | RSI 30-60 rising | MACD histogram positive/turning up | "
-        "BB%B<0.3 (oversold) | price bouncing at support | bullish candle pattern\n"
-        "SELL: EMA9<EMA21 on H1+H4 | RSI 40-70 falling | MACD histogram negative/turning down | "
-        "BB%B>0.7 (overbought) | price rejected at resistance | bearish candle\n"
-        "WAIT: <3 signals aligned | RSI extreme >80/<20 | conflicting TF signals | "
-        "high-impact news pending <30min | BB bandwidth < 0.5% with RSI 40-60 (consolidation/chop)\n\n"
+        "ENTRY QUALITY CHECKLIST (need 4+ signals aligned for confidence 7+):\n"
+        "BUY: EMA9>EMA21 on H1+H4 | RSI 30-55 rising | MACD histogram positive/turning up | "
+        "BB%%B<0.3 (oversold) | price at or bouncing from support | bullish engulfing/hammer | "
+        "ATR showing expansion (move starting, not ending)\n"
+        "SELL: EMA9<EMA21 on H1+H4 | RSI 45-70 falling | MACD histogram negative/turning down | "
+        "BB%%B>0.7 (overbought) | price at or rejected from resistance | bearish engulfing/shooting star | "
+        "ATR showing expansion\n"
+        "WAIT: <4 signals aligned | RSI extreme >80/<20 (exhaustion — reversal likely, not continuation) | "
+        "conflicting TF signals | high-impact news pending <30min | "
+        "BB bandwidth < 0.5%% with RSI 40-60 (consolidation/chop) | "
+        "price mid-range (not at S/R) | spread > $0.40\n\n"
 
         "SIDEWAYS/CONSOLIDATION RULES:\n"
-        "- If BB bandwidth is narrow (<0.5%) AND RSI is 40-60 AND no clear trend → market is consolidating\n"
-        "- In consolidation: prefer WAIT unless price is at clear Support (BUY) or Resistance (SELL)\n"
-        "- Consolidation BUY/SELL should use confidence 5-6 max (smaller position)\n"
+        "- If BB bandwidth is narrow (<0.5%%) AND RSI is 40-60 AND no clear trend → market is consolidating\n"
+        "- In consolidation: STRONGLY prefer WAIT unless price is at extreme Support or Resistance\n"
+        "- Consolidation BUY/SELL max confidence = 5 (smaller position)\n"
         "- If consolidation + imminent news → WAIT (breakout direction unknown)\n\n"
 
-        "TRADE LOG ANALYSIS:\n"
-        "- Review recent trades for patterns (e.g. repeated SL hits at same level = wrong side)\n"
-        "- Heavy BUY bias → actively look for SELL setups\n"
-        "- Consecutive losses → require confidence 7+ and stronger confluence\n"
-        "- If last trade hit SL quickly, check if current setup avoids the same mistake\n\n"
+        "TRADE LOG ANALYSIS (learn from mistakes):\n"
+        "- Review recent trades: if avg win < avg loss → require higher confidence (7+) with trend\n"
+        "- If >70%% trades are one direction (BUY or SELL) → ACTIVELY seek the other direction\n"
+        "- Consecutive losses → require confidence 8+ and strongest confluence\n"
+        "- If recent trades were closed at tiny profit (<$0.50) → the entries were late/poor — wait for better setups\n"
+        "- If SL hit multiple times in same direction → that direction is WRONG, switch or WAIT\n\n"
 
         "MACRO RULES:\n"
         "- DOM/order book missing is NOT bearish (broker limitation)\n"
@@ -1154,9 +1747,13 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "- Geopolitical risk / uncertainty → typically BUY gold (safe haven)\n"
         "- High-impact news within 30min → WAIT (volatility spike risk)\n\n"
 
-        "CONFIDENCE SCALE (1-10):\n"
-        "1-4: Weak signal → WAIT. 5-6: Moderate → trade only with trend. "
-        "7-8: Strong → trade. 9-10: Very strong → high conviction.\n\n"
+        "CONFIDENCE SCALE (1-10) — BE STRICT:\n"
+        "1-5: Weak/unclear signal → ALWAYS WAIT.\n"
+        "6: Moderate with trend alignment → trade only if 4+ signals aligned.\n"
+        "7-8: Strong setup, multiple confluences → trade.\n"
+        "9-10: Exceptional setup, everything aligned → high conviction.\n"
+        "REMEMBER: Over-trading with low confidence is the #1 account killer. "
+        "Saying WAIT when unsure is a winning decision.\n\n"
 
         "Reply EXACTLY in this format (no extra text, no preamble):\n"
         "Sentiment: <Bullish/Bearish/Neutral>\n"
@@ -1370,14 +1967,14 @@ def sync_closed_trades():
 # 4.6  SMART POSITION MANAGER
 # ==========================================
 POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 5))
-MIN_HOLD_SEC            = int(os.getenv("MIN_HOLD_SEC",   60))
+MIN_HOLD_SEC            = int(os.getenv("MIN_HOLD_SEC",   120))
 MAX_HOLD_SEC            = int(os.getenv("MAX_HOLD_SEC",   1800))
 MAX_HOLD_SEC_LOSS       = int(os.getenv("MAX_HOLD_SEC_LOSS", 600))  # Shorter hold for losing positions
 TRAILING_STEP_PRICE     = float(os.getenv("TRAILING_STEP_PRICE",   1.0))
 TRAILING_PROTECT_PCT    = float(os.getenv("TRAILING_PROTECT_PCT",  50))
 PROFIT_LOCK_PCT         = float(os.getenv("PROFIT_LOCK_PCT",        5.0))
 BREAKEVEN_TRIGGER_PCT   = float(os.getenv("BREAKEVEN_TRIGGER_PCT",  0.2))
-MIN_PROFIT_CLOSE_PCT    = float(os.getenv("MIN_PROFIT_CLOSE_PCT",   0.3))
+MIN_PROFIT_CLOSE_PCT    = float(os.getenv("MIN_PROFIT_CLOSE_PCT",   0.5))
 AI_FORECAST_COOLDOWN    = int(os.getenv("AI_FORECAST_COOLDOWN",    20))
 # Partial close — close half the position at this profit threshold (% of balance)
 PARTIAL_CLOSE_PCT       = float(os.getenv("PARTIAL_CLOSE_PCT", 0.5))
@@ -1392,14 +1989,15 @@ FRIDAY_CLOSE_MINUTES_BEFORE = int(os.getenv("FRIDAY_CLOSE_MINUTES_BEFORE", 30))
 FRIDAY_NO_NEW_TRADE_MINUTES = int(os.getenv("FRIDAY_NO_NEW_TRADE_MINUTES", 60))
 
 # 3-Phase Adaptive Trailing Stop (ATR multipliers)
-# Phase 1: Small profit — tight trailing to protect entry
-TRAIL_PHASE1_ATR = float(os.getenv("TRAIL_PHASE1_ATR", 0.30))
-# Phase 2: Good profit (>= min_profit_close) — wider trail, let it breathe
-TRAIL_PHASE2_ATR = float(os.getenv("TRAIL_PHASE2_ATR", 0.55))
+# WIDER GAPS = let winners run to meaningful profit
+# Phase 1: Small profit — protect entry but give room to breathe
+TRAIL_PHASE1_ATR = float(os.getenv("TRAIL_PHASE1_ATR", 0.50))
+# Phase 2: Good profit (>= min_profit_close) — wider trail, let it develop
+TRAIL_PHASE2_ATR = float(os.getenv("TRAIL_PHASE2_ATR", 0.75))
 # Phase 3: After partial close (already banked 50%) — widest, let runner go
-TRAIL_PHASE3_ATR = float(os.getenv("TRAIL_PHASE3_ATR", 0.75))
+TRAIL_PHASE3_ATR = float(os.getenv("TRAIL_PHASE3_ATR", 1.00))
 # Breakeven trigger distance in USD (price must move this far before SL→entry)
-BREAKEVEN_DISTANCE = float(os.getenv("BREAKEVEN_DISTANCE", 0.50))
+BREAKEVEN_DISTANCE = float(os.getenv("BREAKEVEN_DISTANCE", 1.00))
 
 _friday_closed: bool = False  # Flag to prevent repeated Friday close attempts
 
@@ -1695,11 +2293,11 @@ def smart_position_monitor(scalp_tf: str = "M15"):
         min_profit_close   = balance * (MIN_PROFIT_CLOSE_PCT  / 100)
         partial_close_usd  = balance * (PARTIAL_CLOSE_PCT     / 100)
 
-        # 3-Phase Adaptive Trailing (ATR-based)
-        # Phase 1: tight (protect entry)  Phase 2: medium (let it breathe)  Phase 3: wide (runner)
-        trail_gap_p1 = max(0.20, round(atr * TRAIL_PHASE1_ATR, 2)) if atr else 0.30
-        trail_gap_p2 = max(0.40, round(atr * TRAIL_PHASE2_ATR, 2)) if atr else 0.60
-        trail_gap_p3 = max(0.60, round(atr * TRAIL_PHASE3_ATR, 2)) if atr else 0.90
+        # 3-Phase Adaptive Trailing (ATR-based) — WIDER gaps to let winners run
+        # Phase 1: protect entry  Phase 2: let it develop  Phase 3: runner
+        trail_gap_p1 = max(0.50, round(atr * TRAIL_PHASE1_ATR, 2)) if atr else 0.60
+        trail_gap_p2 = max(0.80, round(atr * TRAIL_PHASE2_ATR, 2)) if atr else 1.00
+        trail_gap_p3 = max(1.20, round(atr * TRAIL_PHASE3_ATR, 2)) if atr else 1.50
 
         for pos in positions:
             ticket        = pos["ticket"]
@@ -1770,14 +2368,16 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 trail_gap = trail_gap_p1
                 phase_label = "P1-PROTECT"
 
-            # High watermark protection: if profit dropped >50% from peak, tighten trail
-            if max_profit_seen > 0 and profit > 0 and profit < max_profit_seen * 0.5:
-                trail_gap = trail_gap_p1  # tighten to P1
-                phase_label = f"P1-PROTECT(peak${max_profit_seen:.2f})"
+            # High watermark protection: if profit dropped >65% from peak, tighten trail to P2
+            # (not P1 — P1 is too tight and causes premature exits)
+            if max_profit_seen > 0 and profit > 0 and profit < max_profit_seen * 0.35:
+                trail_gap = trail_gap_p2  # tighten to P2 (not P1)
+                phase_label = f"P2-PROTECT(peak${max_profit_seen:.2f})"
 
             if current_sl != 0:
-                # Dynamic breakeven offset: ATR×0.10 (min $0.05, max $0.30)
-                be_offset = max(0.05, min(0.30, round(atr * 0.10, 2))) if atr else 0.10
+                # Dynamic breakeven offset: ATR×0.15 (min $0.10, max $0.50)
+                # Wider offset = SL is ABOVE entry, locking in a small profit at breakeven
+                be_offset = max(0.10, min(0.50, round(atr * 0.15, 2))) if atr else 0.20
                 if pos_type == "BUY":
                     distance = current_price - open_price
                     # Breakeven: move SL to entry once price moves BREAKEVEN_DISTANCE
@@ -2102,7 +2702,10 @@ def get_today_trade_count() -> int:
 # ==========================================
 MARKET_CLOSED_CHECK_SEC = 300
 CONSECUTIVE_ERR_LIMIT   = 5
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.8))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.5))
+# Minimum seconds between new trade entries (prevent over-trading)
+MIN_TRADE_INTERVAL_SEC = int(os.getenv("MIN_TRADE_INTERVAL_SEC", 120))
+_last_trade_ts: float = 0.0
 
 
 def get_trend_alignment(candles_h1: list, candles_h4: list, candles_d1: list) -> dict:
@@ -2399,10 +3002,12 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
 
         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
         if trade_result and trade_result.get("success"):
+            global _last_trade_ts
+            _last_trade_ts = time.time()  # Update cooldown timer
             _recovery_attempts_recent.append((time.time(), action))
             print(f"[RECOVERY] ✅ Recovery {action} | lot={lot_size} (half-risk) conf={confidence} SL={sl_price} TP={tp_price}")
             log_event("RECOVERY_TRADE", f"{action} lot={lot_size} conf={confidence} after losses")
-            save_trade_to_db(
+            save_trade_with_context(
                 order_id=trade_result["order_id"],
                 symbol=symbol,
                 action=action,
@@ -2410,6 +3015,7 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
                 open_price=trade_result.get("price", ask if action == "BUY" else bid),
                 sl_price=sl_price,
                 tp_price=tp_price,
+                ai_confidence=confidence if isinstance(confidence, int) else None,
             )
             return True
         else:
@@ -2533,6 +3139,19 @@ def main_loop():
                 pass
             break
 
+        # Daily loss circuit breaker
+        daily_ok, daily_msg = check_daily_loss_limit()
+        if not daily_ok:
+            print(f"[SAFETY] 🔴 {daily_msg} — pausing until tomorrow")
+            log_event("DAILY_LOSS_LIMIT", daily_msg)
+            # Sleep until midnight UTC
+            now_utc = datetime.utcnow()
+            midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+            sleep_sec = (midnight - now_utc).total_seconds()
+            print(f"[SAFETY] Sleeping {int(sleep_sec/3600)}h until next day")
+            time.sleep(min(sleep_sec, 28800))  # max 8h sleep
+            continue
+
         try:
             print(f"\n=== 🟢 AI Trader Node | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
@@ -2555,6 +3174,13 @@ def main_loop():
             price = get_price_from_mt5()
             if not price or "error" in price:
                 raise RuntimeError("Failed to fetch price")
+
+            # ---- Post-trade learning: analyze recently closed trades ----
+            try:
+                process_recently_closed_trades()
+                update_daily_performance()
+            except Exception as e:
+                print(f"[POST-TRADE] ⚠️ {e}")
 
             bid    = price["bid"]
             ask    = price["ask"]
@@ -2701,6 +3327,17 @@ def main_loop():
                     "If recommending BUY/SELL during consolidation, use confidence 5-6 max.\n"
                 )
 
+            # === RAG CONTEXT: Self-learning from trade history ===
+            try:
+                rag_context = build_rag_context()
+                if rag_context:
+                    extra_knowledge += "\n\n" + rag_context
+                auto_lessons = get_auto_generated_lessons()
+                if auto_lessons:
+                    extra_knowledge += "\n\n" + auto_lessons
+            except Exception as e:
+                print(f"[RAG] ⚠️ Failed to build RAG context: {e}")
+
             analysis = analyze_with_ai(
                 price, tech_summary,
                 orderbook_summary=ob_summary,
@@ -2736,9 +3373,78 @@ def main_loop():
                     else:
                         print(f"[TREND] AI {action} against trend {trend_dir} but confidence {confidence} >= 8 — allowing")
 
+            # ---- S/R Room-to-Move filter ----
+            # Don't enter if there's not enough room to reach TP before hitting S/R
+            if action in ("BUY", "SELL") and candles_h1 and len(candles_h1) >= 20:
+                sr_h1 = calc_support_resistance(candles_h1, 20)
+                if sr_h1:
+                    current_mid = (bid + ask) / 2
+                    tp_distance_usd = tp_points * 0.01  # convert points to USD
+                    if action == "BUY":
+                        room_to_resist = sr_h1["resistance"] - current_mid
+                        if room_to_resist < tp_distance_usd * 0.6:
+                            confidence = _extract_confidence(analysis)
+                            if confidence < 8:
+                                print(
+                                    f"[S/R] ⚠️ BUY blocked: only ${room_to_resist:.2f} room to resistance "
+                                    f"{sr_h1['resistance']}, need ${tp_distance_usd * 0.6:.2f} (60% of TP), conf={confidence} → WAIT"
+                                )
+                                log_event("SR_FILTER", f"BUY blocked: room={room_to_resist:.2f} < TP*0.6={tp_distance_usd*0.6:.2f}")
+                                action = "WAIT"
+                    elif action == "SELL":
+                        room_to_support = current_mid - sr_h1["support"]
+                        if room_to_support < tp_distance_usd * 0.6:
+                            confidence = _extract_confidence(analysis)
+                            if confidence < 8:
+                                print(
+                                    f"[S/R] ⚠️ SELL blocked: only ${room_to_support:.2f} room to support "
+                                    f"{sr_h1['support']}, need ${tp_distance_usd * 0.6:.2f} (60% of TP), conf={confidence} → WAIT"
+                                )
+                                log_event("SR_FILTER", f"SELL blocked: room={room_to_support:.2f} < TP*0.6={tp_distance_usd*0.6:.2f}")
+                                action = "WAIT"
+
+            # ---- Direction Bias filter ----
+            # If recent trades are heavily biased in one direction, block more of the same
+            if action in ("BUY", "SELL") and win_stats["total"] >= 5:
+                try:
+                    conn_bias = get_db_connection()
+                    cur_bias = conn_bias.cursor()
+                    cur_bias.execute(
+                        """SELECT action, COUNT(*) FROM trades
+                           WHERE opened_at >= NOW() - INTERVAL '24 hours'
+                           GROUP BY action;"""
+                    )
+                    bias_rows = cur_bias.fetchall()
+                    cur_bias.close()
+                    conn_bias.close()
+                    direction_counts = {r[0]: r[1] for r in bias_rows}
+                    total_dir = sum(direction_counts.values())
+                    if total_dir >= 5:
+                        same_dir_count = direction_counts.get(action, 0)
+                        same_dir_pct = same_dir_count / total_dir * 100
+                        if same_dir_pct > 75:
+                            confidence = _extract_confidence(analysis)
+                            if confidence < 8:
+                                print(
+                                    f"[BIAS] ⚠️ {action} blocked: {same_dir_pct:.0f}% of last {total_dir} "
+                                    f"trades are {action}, conf={confidence} < 8 → WAIT"
+                                )
+                                log_event("BIAS_FILTER", f"{action} bias {same_dir_pct:.0f}%, conf={confidence}")
+                                action = "WAIT"
+                except Exception:
+                    pass  # bias check is best-effort
+
             # ---- Execute trade ----
             sl_price = None
             tp_price = None
+            if action in ("BUY", "SELL"):
+                # ---- Trade interval cooldown ----
+                time_since_last = time.time() - _last_trade_ts
+                if time_since_last < MIN_TRADE_INTERVAL_SEC:
+                    wait_remaining = int(MIN_TRADE_INTERVAL_SEC - time_since_last)
+                    print(f"[COOLDOWN] ⏳ {wait_remaining}s remaining before next trade (min interval={MIN_TRADE_INTERVAL_SEC}s) → WAIT")
+                    action = "WAIT"
+
             if action in ("BUY", "SELL"):
                 trades_today = get_today_trade_count()
                 if trades_today >= max_trades:
@@ -2762,8 +3468,13 @@ def main_loop():
                     else:
                         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
                         if trade_result and trade_result.get("success"):
+                            _last_trade_ts = time.time()  # Update cooldown timer
                             log_event("TRADE", f"{action} {symbol} Lot={lot_size} SL={sl_price} TP={tp_price}")
-                            save_trade_to_db(
+                            _trade_confidence = _extract_confidence(analysis) if analysis else None
+                            _trade_regime = "consolidation" if consolidating else (trend_info.get("direction", "unknown") if trend_info else "unknown")
+                            _trade_trend_dir = trend_info.get("direction") if trend_info else None
+                            _trade_trend_str = trend_info.get("strength") if trend_info else None
+                            save_trade_with_context(
                                 order_id=trade_result["order_id"],
                                 symbol=symbol,
                                 action=action,
@@ -2771,6 +3482,10 @@ def main_loop():
                                 open_price=trade_result.get("price", ask if action == "BUY" else bid),
                                 sl_price=sl_price,
                                 tp_price=tp_price,
+                                ai_confidence=_trade_confidence,
+                                market_regime=_trade_regime,
+                                trend_direction=_trade_trend_dir,
+                                trend_strength=_trade_trend_str,
                             )
 
             # ---- Save log ----
