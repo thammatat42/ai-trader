@@ -1475,6 +1475,13 @@ def parse_sentiment(ai_text: str) -> str:
         if m:
             sentiment = m.group(1).upper()
 
+    # Crypto uses a lower confidence threshold (consolidation-friendly)
+    if _is_crypto_symbol():
+        min_confidence = int(os.getenv("MIN_CONFIDENCE_CRYPTO", 6))
+        # WAIT-streak escalation: after many consecutive WAITs, relax by 1
+        if _consecutive_waits >= WAIT_STREAK_THRESHOLD and min_confidence > 5:
+            min_confidence -= 1
+
     if sentiment in ("BUY", "SELL") and confidence < min_confidence:
         print(f"[DECISION] ⚠️ AI says {sentiment} but confidence {confidence} < {min_confidence} → WAIT")
         return "WAIT"
@@ -1845,7 +1852,8 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "3. Support/Resistance proximity: Do NOT BUY near resistance or SELL near support "
         "unless a breakout is confirmed by volume + momentum.\n"
         "3b. DAILY HIGH/LOW: These are key liquidity zones. "
-        "Do NOT BUY within 0.3% of Daily High (trapped longs) or SELL within 0.3% of Daily Low (trapped shorts) "
+        f"Do NOT BUY within {('1.0' if _is_crypto else '0.3')}% of Daily High (trapped longs) "
+        f"or SELL within {('1.0' if _is_crypto else '0.3')}% of Daily Low (trapped shorts) "
         "unless a clear breakout with momentum is confirmed.\n"
         "4. Consider the FULL picture: technicals + trade history + news + patterns. "
         "Do not base decisions on a single indicator.\n"
@@ -1867,10 +1875,13 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "SIDEWAYS/CONSOLIDATION RULES:\n"
         "- If BB bandwidth is narrow (<0.5%%) AND RSI is 40-60 AND no clear trend → market is consolidating\n"
         "- In consolidation: STRONGLY prefer WAIT unless price is at extreme Support or Resistance\n"
-        "- Consolidation BUY/SELL max confidence = 5 (smaller position)\n"
-        "- If consolidation + imminent news → WAIT (breakout direction unknown)\n\n"
+        f"- Consolidation BUY/SELL max confidence = {6 if _is_crypto else 5} (smaller position)\n"
+        "- If consolidation + imminent news → WAIT (breakout direction unknown)\n"
+        + ("- NOTE: Crypto often consolidates on H4/D1 while H1 trends. "
+           "H1 trend alone can justify confidence 6-7 if momentum (MACD+RSI) confirms.\n\n"
+           if _is_crypto else "\n")
 
-        "TRADE LOG ANALYSIS (learn from mistakes):\n"
+        + "TRADE LOG ANALYSIS (learn from mistakes):\n"
         "- Review recent trades: if avg win < avg loss → require higher confidence (7+) with trend\n"
         "- If >70%% trades are one direction (BUY or SELL) → ACTIVELY seek the other direction\n"
         "- Consecutive losses → require confidence 8+ and strongest confluence\n"
@@ -1880,9 +1891,13 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         f"{_macro_rules}\n"
 
         "CONFIDENCE SCALE (1-10) — BE STRICT:\n"
-        "1-5: Weak/unclear signal → ALWAYS WAIT.\n"
-        "6: Moderate with trend alignment → trade only if 4+ signals aligned.\n"
-        "7-8: Strong setup, multiple confluences → trade.\n"
+        + ("1-4: Weak/unclear signal → ALWAYS WAIT.\n"
+           "5: Marginal — trade only with H1 trend + 4 aligned signals.\n"
+           "6: Moderate with H1 trend momentum → trade if 3+ signals aligned.\n"
+           if _is_crypto else
+           "1-5: Weak/unclear signal → ALWAYS WAIT.\n"
+           "6: Moderate with trend alignment → trade only if 4+ signals aligned.\n")
+        + "7-8: Strong setup, multiple confluences → trade.\n"
         "9-10: Exceptional setup, everything aligned → high conviction.\n"
         "REMEMBER: Over-trading with low confidence is the #1 account killer. "
         "Saying WAIT when unsure is a winning decision.\n\n"
@@ -2944,6 +2959,10 @@ _last_trade_ts: float = 0.0
 _last_analysis_price: float = 0.0   # For price-event trigger
 PRICE_EVENT_PCT = float(os.getenv("PRICE_EVENT_PCT", 0.2))  # % move to trigger re-analysis
 
+# WAIT-streak tracking: escalates confidence threshold for crypto after long WAIT runs
+_consecutive_waits: int = 0
+WAIT_STREAK_THRESHOLD = int(os.getenv("WAIT_STREAK_THRESHOLD", 10))  # after N WAITs, relax crypto conf by 1
+
 
 def get_trend_alignment(candles_h1: list, candles_h4: list, candles_d1: list) -> dict:
     """
@@ -3558,12 +3577,21 @@ def main_loop():
             if trend_context:
                 extra_knowledge += trend_context
             if consolidating:
-                extra_knowledge += (
-                    "\n=== CONSOLIDATION WARNING ===\n"
-                    "Market is currently CONSOLIDATING (narrow BB bandwidth + neutral RSI). "
-                    "Prefer WAIT unless price is at clear Support/Resistance with strong candle confirmation. "
-                    "If recommending BUY/SELL during consolidation, use confidence 5-6 max.\n"
-                )
+                if _is_crypto_symbol():
+                    extra_knowledge += (
+                        "\n=== CONSOLIDATION NOTE (Crypto) ===\n"
+                        "H4/D1 are consolidating, but this is NORMAL for crypto. "
+                        "If H1 shows a clear trend (EMA alignment + MACD momentum), "
+                        "you CAN trade with confidence 6-7. Focus on H1 trend + momentum signals. "
+                        "Only WAIT if H1 is ALSO sideways.\n"
+                    )
+                else:
+                    extra_knowledge += (
+                        "\n=== CONSOLIDATION WARNING ===\n"
+                        "Market is currently CONSOLIDATING (narrow BB bandwidth + neutral RSI). "
+                        "Prefer WAIT unless price is at clear Support/Resistance with strong candle confirmation. "
+                        "If recommending BUY/SELL during consolidation, use confidence 5-6 max.\n"
+                    )
 
             # === RAG CONTEXT: Self-learning from trade history ===
             try:
@@ -3606,20 +3634,23 @@ def main_loop():
 
             # ---- Trend alignment filter ----
             # If AI says BUY/SELL but trend is opposite on H1+H4, require higher confidence
+            # Crypto: H1 alone is sufficient — only block counter-trend if strength >= 3 (all TFs against)
             if action in ("BUY", "SELL") and trend_info:
                 trend_dir = trend_info["direction"]
                 trend_str = trend_info["strength"]
-                if trend_dir != "MIXED" and trend_dir != action and trend_str >= 2:
+                _min_trend_str = 3 if _is_crypto_symbol() else 2  # crypto: only block if ALL TFs disagree
+                _min_counter_conf = 7 if _is_crypto_symbol() else 8
+                if trend_dir != "MIXED" and trend_dir != action and trend_str >= _min_trend_str:
                     confidence = _extract_confidence(analysis)
-                    if confidence < 8:
+                    if confidence < _min_counter_conf:
                         print(
                             f"[TREND] ⚠️ AI says {action} but trend is {trend_dir} "
-                            f"(strength {trend_str}/3), confidence {confidence} < 8 → WAIT"
+                            f"(strength {trend_str}/3), confidence {confidence} < {_min_counter_conf} → WAIT"
                         )
                         log_event("TREND_FILTER", f"Blocked {action} — trend={trend_dir} str={trend_str} conf={confidence}")
                         action = "WAIT"
                     else:
-                        print(f"[TREND] AI {action} against trend {trend_dir} but confidence {confidence} >= 8 — allowing")
+                        print(f"[TREND] AI {action} against trend {trend_dir} but confidence {confidence} >= {_min_counter_conf} — allowing")
 
             # ---- S/R Room-to-Move filter ----
             # Don't enter if there's not enough room to reach TP before hitting S/R
@@ -3750,8 +3781,18 @@ def main_loop():
             journal_detect_patterns()
 
             # Record price for price-event trigger
-            global _last_analysis_price
+            global _last_analysis_price, _consecutive_waits
             _last_analysis_price = (bid + ask) / 2
+
+            # Track WAIT streaks (crypto escalation)
+            if action == "WAIT":
+                _consecutive_waits += 1
+                if _is_crypto_symbol() and _consecutive_waits >= WAIT_STREAK_THRESHOLD:
+                    print(f"[WAIT-STREAK] ⚠️ {_consecutive_waits} consecutive WAITs — crypto confidence relaxed by 1")
+            else:
+                if _consecutive_waits > 0:
+                    print(f"[WAIT-STREAK] ✅ Reset after {_consecutive_waits} WAITs — trade placed")
+                _consecutive_waits = 0
 
             sync_closed_trades()
             consecutive_errors = 0
