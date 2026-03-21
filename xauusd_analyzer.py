@@ -14,6 +14,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ==========================================
+# THINKING MODE (Qwen 3.5 / reasoning models)
+# ==========================================
+AI_THINKING = os.getenv("AI_THINKING", "false").lower() in ("true", "1", "yes")
+
+
+def _strip_thinking(text: str) -> str:
+    """Strip <think>...</think> blocks from AI responses (thinking/reasoning models)."""
+    if "<think>" not in text:
+        return text
+    stripped = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    return stripped if stripped else text
+
 # HTTP Session for connection pooling / keep-alive
 http_session = requests.Session()
 
@@ -1041,11 +1054,13 @@ def analyze_closed_trade(trade_row: dict) -> dict | None:
         "max_tokens": 200,
         "temperature": 0.05,
     }
+    if AI_THINKING:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
 
     try:
-        resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=15)
+        resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=30 if AI_THINKING else 15)
         resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"].strip()
+        reply = _strip_thinking(resp.json()["choices"][0]["message"]["content"].strip())
 
         # Parse JSON from response
         json_match = re.search(r'\{.*\}', reply, re.DOTALL)
@@ -1861,12 +1876,18 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "max_tokens":  max_tokens,
         "temperature": temperature,
     }
+    top_p = os.getenv("TOP_P")
+    if top_p:
+        payload["top_p"] = float(top_p)
+    if AI_THINKING:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
 
+    ai_timeout = 60 if AI_THINKING else 15
     max_retries = 2
     for attempt in range(1, max_retries + 1):
         t_start = time.time()
         try:
-            response  = http_session.post(url, headers=headers, json=payload, timeout=15)
+            response  = http_session.post(url, headers=headers, json=payload, timeout=ai_timeout)
             response.raise_for_status()
             resp_json = response.json()
             elapsed   = int((time.time() - t_start) * 1000)
@@ -1878,7 +1899,8 @@ def analyze_with_ai(price_data, technical_summary: str = "",
                 total_tokens=usage.get("total_tokens", 0),
                 response_time_ms=elapsed, status="OK",
             )
-            return resp_json["choices"][0]["message"]["content"].strip()
+            raw = resp_json["choices"][0]["message"]["content"].strip()
+            return _strip_thinking(raw)
         except Exception as e:
             elapsed = int((time.time() - t_start) * 1000)
             save_api_usage(
@@ -2310,7 +2332,7 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
             total_tokens=usage.get("total_tokens", 0),
             response_time_ms=elapsed, status="OK_FORECAST",
         )
-        reply = resp_json["choices"][0]["message"]["content"].strip().upper()
+        reply = _strip_thinking(resp_json["choices"][0]["message"]["content"].strip()).upper()
         # Reset forecast failure counter on success
         _forecast_failures.clear()
         if "CLOSE" in reply:
