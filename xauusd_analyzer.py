@@ -34,6 +34,13 @@ _position_state_lock = threading.Lock()
 _vps_failures = 0
 _vps_failure_window_start = 0.0
 
+# Point size: minimum price increment for the instrument
+# XAUUSD (Exness): 2 decimals → POINT_SIZE=0.01 (1 point = $0.01 movement)
+# BTCUSD (Exness): 2 decimals → POINT_SIZE=0.01 (same, but contract value differs)
+# Adjust if your broker uses different decimal places for BTC
+POINT_SIZE = float(os.getenv("POINT_SIZE", 0.01))
+_POINTS_PER_UNIT = round(1.0 / POINT_SIZE)  # inverse: 100 for 0.01, 10 for 0.1, 1 for 1.0
+
 
 def get_redis() -> redis.Redis | None:
     """Lazy-init Redis connection"""
@@ -81,9 +88,19 @@ def get_db_connection():
 
 
 # ==========================================
-# HELPER: Check Market Open/Close (XAUUSD)
+# HELPER: Check Market Open/Close (symbol-aware)
 # ==========================================
+def _is_crypto_symbol(symbol: str = "") -> bool:
+    """Return True for crypto symbols that trade 24/7 (BTC, ETH, etc.)."""
+    sym = (symbol or os.getenv("SYMBOL", "XAUUSD")).upper()
+    return any(sym.startswith(prefix) for prefix in ("BTC", "ETH", "XRP", "SOL", "DOGE", "LTC", "BNB", "ADA", "CRYPTO"))
+
+
 def is_market_open() -> tuple[bool, str]:
+    # Crypto trades 24/7 — never closed
+    if _is_crypto_symbol():
+        return True, "Crypto market: always open"
+
     now = datetime.now(timezone.utc)
     weekday = now.weekday()   # 0=Mon, 4=Fri, 5=Sat, 6=Sun
     hour = now.hour
@@ -144,8 +161,8 @@ def calculate_lot_size(atr_value: float | None = None) -> dict:
     point_value_per_lot = float(os.getenv("POINT_VALUE_PER_LOT", 1.0))
 
     if atr_value and atr_value > 0:
-        # ATR is real price delta (e.g. 5.50 USD) -> convert to points (×100)
-        atr_points = atr_value * 100
+        # ATR is real price delta (e.g. 5.50 USD) -> convert to points
+        atr_points = atr_value * _POINTS_PER_UNIT
         sl_points = round(atr_points * atr_sl_multiplier)
         tp_points = round(atr_points * atr_tp_multiplier)
         sl_points = max(min_sl, min(max_sl, sl_points))
@@ -509,6 +526,24 @@ GOLD_KEYWORDS = [
     "central bank", "monetary policy", "quantitative", "recession",
 ]
 
+CRYPTO_KEYWORDS = [
+    "bitcoin", "btc", "crypto", "ethereum", "blockchain", "sec", "etf",
+    "halving", "mining", "stablecoin", "defi", "exchange", "binance",
+    "coinbase", "regulation", "fed", "fomc", "interest rate", "inflation",
+    "liquidity", "whale", "on-chain", "hash rate", "spot etf",
+]
+
+
+def _get_news_keywords() -> list[str]:
+    """Return appropriate news keywords based on current symbol."""
+    return CRYPTO_KEYWORDS if _is_crypto_symbol() else GOLD_KEYWORDS
+
+
+def _get_news_category() -> str:
+    """Return finnhub news category for current symbol."""
+    return "crypto" if _is_crypto_symbol() else "forex"
+
+
 # FIX #8: News events that should pause ALL new trades (code-level guard, not just AI)
 HIGH_IMPACT_KEYWORDS = ["nonfarm", "nfp", "fomc", "cpi", "ppi", "gdp", "interest rate", "fomc"]
 
@@ -544,7 +579,7 @@ def fetch_economic_calendar() -> list[dict]:
             impact  = ev.get("impact", "").lower()
             country = ev.get("country", "")
             name    = ev.get("event", "").lower()
-            if (country == "US" and impact in ("high", "medium")) or any(kw in name for kw in GOLD_KEYWORDS):
+            if (country == "US" and impact in ("high", "medium")) or any(kw in name for kw in _get_news_keywords()):
                 important.append({
                     "time":     ev.get("time", ""),
                     "country":  country,
@@ -578,7 +613,7 @@ def fetch_market_news() -> list[dict]:
     try:
         resp = http_session.get(
             FINNHUB_NEWS_URL,
-            params={"category": "forex"},
+            params={"category": _get_news_category()},
             headers={"X-Finnhub-Token": api_key},
             timeout=10,
         )
@@ -592,7 +627,7 @@ def fetch_market_news() -> list[dict]:
             headline = art.get("headline", "").lower()
             summary  = art.get("summary",  "").lower()
             text     = headline + " " + summary
-            if any(kw in text for kw in GOLD_KEYWORDS):
+            if any(kw in text for kw in _get_news_keywords()):
                 relevant.append({
                     "headline": art.get("headline", ""),
                     "summary":  art.get("summary",  "")[:200],
@@ -621,7 +656,8 @@ def build_news_summary() -> str:
 
     news = fetch_market_news()
     if news:
-        lines.append("--- Latest Gold/USD News ---")
+        _sym = os.getenv("SYMBOL", "XAUUSD")
+        lines.append(f"--- Latest {_sym} News ---")
         for n in news:
             lines.append(f"  • {n['headline']}")
 
@@ -985,7 +1021,7 @@ def analyze_closed_trade(trade_row: dict) -> dict | None:
     outcome = "WIN" if profit > 0 else "LOSS"
 
     prompt = (
-        f"Analyze this completed XAUUSD trade:\n"
+        f"Analyze this completed {os.getenv('SYMBOL', 'XAUUSD')} trade:\n"
         f"Action: {action} | Open: {open_p} | Close: {close_p} | P/L: ${profit:+.2f} ({outcome})\n"
         f"SL: {sl} | TP: {tp} | AI Confidence: {conf} | Hold: {hold_sec}s\n"
         f"Market Regime: {regime} | Trend Direction: {trend}\n\n"
@@ -1400,12 +1436,12 @@ def send_trade_to_mt5(action: str, symbol: str, lot: float,
 
     if action == "BUY":
         entry    = ask
-        sl_price = round(entry - sl_points * 0.01, 2)
-        tp_price = round(entry + tp_points * 0.01, 2)
+        sl_price = round(entry - sl_points * POINT_SIZE, 2)
+        tp_price = round(entry + tp_points * POINT_SIZE, 2)
     elif action == "SELL":
         entry    = bid
-        sl_price = round(entry + sl_points * 0.01, 2)
-        tp_price = round(entry - tp_points * 0.01, 2)
+        sl_price = round(entry + sl_points * POINT_SIZE, 2)
+        tp_price = round(entry - tp_points * POINT_SIZE, 2)
     else:
         print("[INFO] ⏸️  AI recommends WAIT - no trade order sent")
         return None
@@ -1685,20 +1721,56 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         return "ERROR"
 
     stf = scalp_tf
+    _sym = os.getenv("SYMBOL", "XAUUSD")
+    _is_crypto = _is_crypto_symbol(_sym)
+
+    # Symbol-specific prompt sections
+    if _is_crypto:
+        _asset_desc = f"{_sym} (Bitcoin/Crypto)"
+        _style_desc = (
+            f"TRADING STYLE: Short-term scalping ({_sym}, 5-30 min hold, target meaningful profit per trade). "
+        )
+        _macro_rules = (
+            "MACRO RULES:\n"
+            "- BTC is a risk-on asset: equities up → typically BUY BTC\n"
+            "- Fed hawkish / rates up → typically SELL BTC (tightening liquidity)\n"
+            "- ETF inflows → bullish for BTC, outflows → bearish\n"
+            "- Whale accumulation / on-chain metrics → watch for large moves\n"
+            "- High-impact macro news (CPI, FOMC) → WAIT for volatility to settle\n"
+            "- Crypto trades 24/7 — weekend liquidity is lower, spreads wider\n"
+        )
+        _room_to_move = "Only enter when price has ROOM TO MOVE to the next S/R level in your direction."
+        _late_entry = "If recent trades were closed at tiny profit → the entries were late/poor — wait for better setups"
+    else:
+        _asset_desc = f"{_sym} (Gold)"
+        _style_desc = (
+            "TRADING STYLE: Short-term scalping (5-15 min hold, target $2-$5 profit per 0.01 lot). "
+        )
+        _macro_rules = (
+            "MACRO RULES:\n"
+            "- DOM/order book missing is NOT bearish (broker limitation)\n"
+            "- H1+H4 agreement outweighs D1 for scalp timing\n"
+            "- USD strength (DXY up) → typically SELL gold\n"
+            "- Geopolitical risk / uncertainty → typically BUY gold (safe haven)\n"
+            "- High-impact news within 30min → WAIT (volatility spike risk)\n"
+        )
+        _room_to_move = "Only enter when price has ROOM TO MOVE: at least $2-$3 to the next S/R level in your direction."
+        _late_entry = "If recent trades were closed at tiny profit (<$0.50) → the entries were late/poor — wait for better setups"
+
     system_prompt = (
-        "You are a professional XAUUSD (Gold) scalp trader with 15+ years experience. "
+        f"You are a professional {_asset_desc} scalp trader with 15+ years experience. "
         f"You analyze multi-timeframe data ({stf}, H1, H4, D1) using technical indicators, "
         "price action, order flow, and macro events.\n\n"
 
-        "TRADING STYLE: Short-term scalping (5-15 min hold, target $2-$5 profit per 0.01 lot). "
+        f"{_style_desc}"
         "You are BALANCED — you trade both BUY and SELL with equal discipline. "
         "QUALITY over QUANTITY: Only take HIGH-PROBABILITY setups. "
         "It is better to WAIT and miss a trade than to enter a bad one.\n\n"
 
         "PROFIT-FOCUSED RULES (most important):\n"
         "1. Trading is for PROFIT, not just winning. A small win that gets stopped out is worse than waiting.\n"
-        "2. Only enter when price has ROOM TO MOVE: at least $2-$3 to the next S/R level in your direction.\n"
-        "3. Entry timing matters: Enter on pullbacks to EMA/support, NOT after price already moved $2+ in your direction.\n"
+        f"2. {_room_to_move}\n"
+        "3. Entry timing matters: Enter on pullbacks to EMA/support, NOT after price already moved significantly in your direction.\n"
         "4. If price is mid-range between support and resistance with no momentum → WAIT.\n"
         "5. NEVER chase a move that already happened. If price just spiked $3-$5, wait for a pullback.\n\n"
 
@@ -1725,7 +1797,7 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "WAIT: <4 signals aligned | RSI extreme >80/<20 (exhaustion — reversal likely, not continuation) | "
         "conflicting TF signals | high-impact news pending <30min | "
         "BB bandwidth < 0.5%% with RSI 40-60 (consolidation/chop) | "
-        "price mid-range (not at S/R) | spread > $0.40\n\n"
+        "price mid-range (not at S/R) | spread too wide\n\n"
 
         "SIDEWAYS/CONSOLIDATION RULES:\n"
         "- If BB bandwidth is narrow (<0.5%%) AND RSI is 40-60 AND no clear trend → market is consolidating\n"
@@ -1737,15 +1809,10 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "- Review recent trades: if avg win < avg loss → require higher confidence (7+) with trend\n"
         "- If >70%% trades are one direction (BUY or SELL) → ACTIVELY seek the other direction\n"
         "- Consecutive losses → require confidence 8+ and strongest confluence\n"
-        "- If recent trades were closed at tiny profit (<$0.50) → the entries were late/poor — wait for better setups\n"
+        f"- {_late_entry}\n"
         "- If SL hit multiple times in same direction → that direction is WRONG, switch or WAIT\n\n"
 
-        "MACRO RULES:\n"
-        "- DOM/order book missing is NOT bearish (broker limitation)\n"
-        "- H1+H4 agreement outweighs D1 for scalp timing\n"
-        "- USD strength (DXY up) → typically SELL gold\n"
-        "- Geopolitical risk / uncertainty → typically BUY gold (safe haven)\n"
-        "- High-impact news within 30min → WAIT (volatility spike risk)\n\n"
+        f"{_macro_rules}\n"
 
         "CONFIDENCE SCALE (1-10) — BE STRICT:\n"
         "1-5: Weak/unclear signal → ALWAYS WAIT.\n"
@@ -1762,7 +1829,7 @@ def analyze_with_ai(price_data, technical_summary: str = "",
     )
 
     sections = [
-        "=== XAUUSD LIVE DATA ===",
+        f"=== {_sym} LIVE DATA ===",
         f"Current Price -> Bid: {price_data['bid']}, Ask: {price_data['ask']}",
         f"Spread: {round(price_data['ask'] - price_data['bid'], 2)}",
     ]
@@ -2213,7 +2280,7 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
         indicators.append(f"Support={sr['support']:.2f} Resist={sr['resistance']:.2f}")
 
     compact_prompt = (
-        f"XAUUSD {scalp_tf} candles: {candle_str}\n"
+        f"{_sym} {scalp_tf} candles: {candle_str}\n"
         f"{' | '.join(indicators)}\n"
         f"Position: {position_type} | Profit=${profit:+.2f} | Hold={hold_sec}s\n"
         f"Question: Should this {position_type} position be held or closed NOW?\n"
@@ -2295,9 +2362,16 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
         # 3-Phase Adaptive Trailing (ATR-based) — WIDER gaps to let winners run
         # Phase 1: protect entry  Phase 2: let it develop  Phase 3: runner
-        trail_gap_p1 = max(0.50, round(atr * TRAIL_PHASE1_ATR, 2)) if atr else 0.60
-        trail_gap_p2 = max(0.80, round(atr * TRAIL_PHASE2_ATR, 2)) if atr else 1.00
-        trail_gap_p3 = max(1.20, round(atr * TRAIL_PHASE3_ATR, 2)) if atr else 1.50
+        # Floor values are configurable for different instruments (gold vs BTC)
+        _trail_floor_p1 = float(os.getenv("TRAIL_FLOOR_P1", 0.50))
+        _trail_floor_p2 = float(os.getenv("TRAIL_FLOOR_P2", 0.80))
+        _trail_floor_p3 = float(os.getenv("TRAIL_FLOOR_P3", 1.20))
+        _trail_fallback_p1 = _trail_floor_p1 * 1.2
+        _trail_fallback_p2 = _trail_floor_p2 * 1.25
+        _trail_fallback_p3 = _trail_floor_p3 * 1.25
+        trail_gap_p1 = max(_trail_floor_p1, round(atr * TRAIL_PHASE1_ATR, 2)) if atr else _trail_fallback_p1
+        trail_gap_p2 = max(_trail_floor_p2, round(atr * TRAIL_PHASE2_ATR, 2)) if atr else _trail_fallback_p2
+        trail_gap_p3 = max(_trail_floor_p3, round(atr * TRAIL_PHASE3_ATR, 2)) if atr else _trail_fallback_p3
 
         for pos in positions:
             ticket        = pos["ticket"]
@@ -2375,9 +2449,10 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 phase_label = f"P2-PROTECT(peak${max_profit_seen:.2f})"
 
             if current_sl != 0:
-                # Dynamic breakeven offset: ATR×0.15 (min $0.10, max $0.50)
-                # Wider offset = SL is ABOVE entry, locking in a small profit at breakeven
-                be_offset = max(0.10, min(0.50, round(atr * 0.15, 2))) if atr else 0.20
+                # Dynamic breakeven offset: ATR×0.15 — scaled by instrument
+                _be_min = float(os.getenv("BE_OFFSET_MIN", 0.10))
+                _be_max = float(os.getenv("BE_OFFSET_MAX", 0.50))
+                be_offset = max(_be_min, min(_be_max, round(atr * 0.15, 2))) if atr else (_be_min + _be_max) / 2
                 if pos_type == "BUY":
                     distance = current_price - open_price
                     # Breakeven: move SL to entry once price moves BREAKEVEN_DISTANCE
@@ -2581,8 +2656,8 @@ def _position_monitor_thread():
             if now_utc.weekday() != 4:
                 _friday_closed = False
 
-            # ---- Friday Auto-Close (before market close check) ----
-            if FRIDAY_AUTO_CLOSE and is_friday_close_window(FRIDAY_CLOSE_MINUTES_BEFORE):
+            # ---- Friday Auto-Close (skip for crypto — no weekend gap) ----
+            if FRIDAY_AUTO_CLOSE and not _is_crypto_symbol() and is_friday_close_window(FRIDAY_CLOSE_MINUTES_BEFORE):
                 friday_auto_close()
 
             if market_open:
@@ -2994,11 +3069,11 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
         lot_size = max(0.01, round(risk_info["lot_size"] * 0.5, 2))
 
         if action == "BUY":
-            sl_price = round(ask - sl_points * 0.01, 2)
-            tp_price = round(ask + tp_points * 0.01, 2)
+            sl_price = round(ask - sl_points * POINT_SIZE, 2)
+            tp_price = round(ask + tp_points * POINT_SIZE, 2)
         else:
-            sl_price = round(bid + sl_points * 0.01, 2)
-            tp_price = round(bid - tp_points * 0.01, 2)
+            sl_price = round(bid + sl_points * POINT_SIZE, 2)
+            tp_price = round(bid - tp_points * POINT_SIZE, 2)
 
         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
         if trade_result and trade_result.get("success"):
@@ -3082,8 +3157,8 @@ def main_loop():
             log_event("RESUME", f"Resumed after {pause_retries} retries")
             pause_retries = 0
 
-        # ---- Friday: block new trades before close ----
-        if FRIDAY_AUTO_CLOSE and is_friday_close_window(FRIDAY_NO_NEW_TRADE_MINUTES):
+        # ---- Friday: block new trades before close (skip for crypto) ----
+        if FRIDAY_AUTO_CLOSE and not _is_crypto_symbol() and is_friday_close_window(FRIDAY_NO_NEW_TRADE_MINUTES):
             now_f = datetime.now(timezone.utc)
             mins_left = (22 * 60) - (now_f.hour * 60 + now_f.minute)
             print(f"[FRIDAY] 🔒 {mins_left}min to market close — no new trades (monitor still active)")
@@ -3379,7 +3454,7 @@ def main_loop():
                 sr_h1 = calc_support_resistance(candles_h1, 20)
                 if sr_h1:
                     current_mid = (bid + ask) / 2
-                    tp_distance_usd = tp_points * 0.01  # convert points to USD
+                    tp_distance_usd = tp_points * POINT_SIZE  # convert points to USD
                     if action == "BUY":
                         room_to_resist = sr_h1["resistance"] - current_mid
                         if room_to_resist < tp_distance_usd * 0.6:
@@ -3453,11 +3528,11 @@ def main_loop():
                     action = "WAIT"
                 else:
                     if action == "BUY":
-                        sl_price = round(ask - sl_points * 0.01, 2)
-                        tp_price = round(ask + tp_points * 0.01, 2)
+                        sl_price = round(ask - sl_points * POINT_SIZE, 2)
+                        tp_price = round(ask + tp_points * POINT_SIZE, 2)
                     else:
-                        sl_price = round(bid + sl_points * 0.01, 2)
-                        tp_price = round(bid - tp_points * 0.01, 2)
+                        sl_price = round(bid + sl_points * POINT_SIZE, 2)
+                        tp_price = round(bid - tp_points * POINT_SIZE, 2)
 
                     # Sync closed trades + re-check position count before opening
                     sync_closed_trades()
