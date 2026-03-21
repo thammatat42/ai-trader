@@ -2765,19 +2765,20 @@ def check_bot_status():
             "SELECT is_running, interval_seconds, "
             "COALESCE(pause_max_retries, 5), COALESCE(pause_retry_sec, 10), "
             "COALESCE(max_trades_per_day, 10), "
-            "COALESCE(scalp_timeframe, 'M15') "
+            "COALESCE(scalp_timeframe, 'M15'), "
+            "COALESCE(ai_thinking, FALSE) "
             "FROM bot_settings LIMIT 1;"
         )
         row = cur.fetchone()
         cur.close()
         conn.close()
         if row:
-            return bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]), str(row[5])
+            return bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]), str(row[5]), bool(row[6])
         # No settings row → default STOPPED (must start via Dashboard)
-        return False, 300, 5, 10, 10, "M15"
+        return False, 300, 5, 10, 10, "M15", False
     except Exception as e:
         print(f"[ERROR] Failed to check Bot status: {e}")
-        return False, 60, 5, 10, 10, "M15"
+        return False, 60, 5, 10, 10, "M15", False
 
 
 def get_today_trade_count() -> int:
@@ -3161,7 +3162,12 @@ def main_loop():
         _last_market_log = None
 
         # ---- Dashboard kill switch ----
-        is_running, interval, max_retries, retry_sec, max_trades, scalp_tf = check_bot_status()
+        is_running, interval, max_retries, retry_sec, max_trades, scalp_tf, db_thinking = check_bot_status()
+
+        # Update AI_THINKING from dashboard setting
+        global AI_THINKING
+        AI_THINKING = db_thinking or os.getenv("AI_THINKING", "false").lower() in ("true", "1", "yes")
+
         if not is_running:
             pause_retries += 1
             if max_retries > 0 and pause_retries >= max_retries:

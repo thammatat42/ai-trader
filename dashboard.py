@@ -15,6 +15,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import redis as redis_lib
 import requests as req_lib
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -25,8 +26,8 @@ load_dotenv()
 # PAGE CONFIG
 # ==========================================
 st.set_page_config(
-    page_title="AI Gold Trader Dashboard",
-    page_icon="🥇",
+    page_title="AI Trader Dashboard",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -214,8 +215,8 @@ def _render_login_page():
             box-shadow: 0 8px 32px rgba(0,0,0,0.4);
             text-align: center;
         ">
-            <div style="font-size: 3rem; margin-bottom: 8px;">🥇</div>
-            <h2 style="color: #f59e0b !important; margin: 0 0 4px 0;">AI Gold Trader</h2>
+            <div style="font-size: 3rem; margin-bottom: 8px;">📈</div>
+            <h2 style="color: #f59e0b !important; margin: 0 0 4px 0;">AI Trader</h2>
             <p style="color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px;">
                 กรุณายืนยันตัวตนเพื่อเข้าใช้งาน Dashboard
             </p>
@@ -430,8 +431,11 @@ def sync_mt5_to_db():
 # ==========================================
 # SIDEBAR – NAVIGATION
 # ==========================================
-st.sidebar.markdown("# 🥇 AI Gold Trader")
-st.sidebar.caption("Enterprise Dashboard v2.1")
+_SYMBOL = os.getenv("SYMBOL", "XAUUSD")
+_IS_CRYPTO = _SYMBOL.upper().startswith(("BTC", "ETH", "SOL", "DOGE", "XRP", "CRYPTO"))
+
+st.sidebar.markdown("# 📈 AI Trader")
+st.sidebar.caption(f"Enterprise Dashboard v2.2 • {_SYMBOL}")
 st.sidebar.divider()
 page = st.sidebar.radio(
     "Navigation",
@@ -458,7 +462,7 @@ if os.getenv("DASHBOARD_PASSWORD", ""):
 # PAGE: OVERVIEW
 # ==========================================
 if page == "🏠 Overview":
-    st.markdown("## 🥇 AI Gold Trader — Dashboard")
+    st.markdown(f"## 📈 AI Trader — {_SYMBOL} Dashboard")
 
     # ── System Status Bar ──
     now_utc = datetime.now(timezone.utc)
@@ -466,7 +470,9 @@ if page == "🏠 Overview":
     h = now_utc.hour
     market_open = True
     market_msg = "🟢 OPEN"
-    if wd == 5:
+    if _IS_CRYPTO:
+        pass  # Crypto trades 24/7 — always open
+    elif wd == 5:
         market_open = False
         market_msg = "🔴 CLOSED (Sat)"
     elif wd == 6 and h < 23:
@@ -1224,35 +1230,122 @@ elif page == "📊 Trade Reports":
 
     # ----- TRADE HISTORY TABLE -----
     st.markdown("### 📜 Trade History")
-    history_limit = st.number_input("Max rows", 10, 1000, 100, key="hist_limit")
+
+    hist_col1, hist_col2, hist_col3 = st.columns(3)
+    with hist_col1:
+        hist_period = st.selectbox(
+            "Period",
+            ["Last 7 Days", "Last 14 Days", "Last 30 Days", "Last 90 Days", "All Time"],
+            index=0,
+            key="hist_period",
+        )
+    with hist_col2:
+        hist_status = st.selectbox(
+            "Status",
+            ["CLOSED", "OPEN", "All"],
+            index=0,
+            key="hist_status",
+        )
+    with hist_col3:
+        hist_action = st.selectbox(
+            "Direction",
+            ["All", "BUY", "SELL"],
+            index=0,
+            key="hist_action",
+        )
+
+    hist_period_map = {
+        "Last 7 Days": "closed_at >= NOW() - INTERVAL '7 days'",
+        "Last 14 Days": "closed_at >= NOW() - INTERVAL '14 days'",
+        "Last 30 Days": "closed_at >= NOW() - INTERVAL '30 days'",
+        "Last 90 Days": "closed_at >= NOW() - INTERVAL '90 days'",
+        "All Time": "TRUE",
+    }
+    hist_where = [hist_period_map.get(hist_period, "TRUE")]
+    if hist_status != "All":
+        hist_where.append(f"status = '{hist_status}'")
+    if hist_action != "All":
+        hist_where.append(f"action = '{hist_action}'")
+    hist_where_sql = " AND ".join(hist_where)
+
     history_rows = run_query(
-        """
+        f"""
         SELECT order_id, symbol, action, lot, open_price, close_price,
-               sl_price, tp_price, profit, opened_at, closed_at
+               sl_price, tp_price, profit, status,
+               ai_confidence, market_regime, trend_direction,
+               opened_at, closed_at,
+               EXTRACT(EPOCH FROM (closed_at - opened_at))::int AS hold_sec
         FROM trades
-        WHERE status = 'CLOSED'
-        ORDER BY closed_at DESC
-        LIMIT %s;
-        """,
-        (history_limit,),
+        WHERE {hist_where_sql}
+        ORDER BY COALESCE(closed_at, opened_at) DESC;
+        """
     )
     if history_rows:
         df_hist = pd.DataFrame(history_rows)
+
+        # Summary row
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Total Trades", len(df_hist))
+        if "profit" in df_hist.columns:
+            closed_df = df_hist[df_hist["status"] == "CLOSED"]
+            net_pnl = closed_df["profit"].sum() if len(closed_df) > 0 else 0
+            wins = len(closed_df[closed_df["profit"] > 0])
+            losses = len(closed_df[closed_df["profit"] <= 0])
+            wr = round(wins / len(closed_df) * 100, 1) if len(closed_df) > 0 else 0
+            h2.metric("Net P/L", f"${net_pnl:,.2f}")
+            h3.metric("Win Rate", f"{wr}%")
+            h4.metric(f"W/L", f"{wins}/{losses}")
+
+        # Color-code action
+        def color_trade_action(val):
+            if val == "BUY":
+                return "color: #22c55e; font-weight: bold"
+            elif val == "SELL":
+                return "color: #ef4444; font-weight: bold"
+            return ""
+
+        def color_profit(val):
+            try:
+                v = float(val)
+                if v > 0:
+                    return "color: #22c55e"
+                elif v < 0:
+                    return "color: #ef4444"
+            except (ValueError, TypeError):
+                pass
+            return ""
+
+        styled = df_hist.style
+        if "action" in df_hist.columns:
+            styled = styled.applymap(color_trade_action, subset=["action"])
+        if "profit" in df_hist.columns:
+            styled = styled.applymap(color_profit, subset=["profit"])
+
         st.dataframe(
-            df_hist,
+            styled,
             use_container_width=True,
-            height=500,
+            height=600,
             column_config={
                 "profit": st.column_config.NumberColumn("Profit ($)", format="$%.2f"),
                 "open_price": st.column_config.NumberColumn("Entry", format="%.2f"),
                 "close_price": st.column_config.NumberColumn("Exit", format="%.2f"),
+                "hold_sec": st.column_config.NumberColumn("Hold (s)"),
             },
         )
 
         csv_hist = df_hist.to_csv(index=False).encode("utf-8")
         st.download_button("📥 Export Trade History CSV", csv_hist, "trade_history.csv", "text/csv")
+
+        # --- Raw AI Data expander ---
+        with st.expander("🔍 View Raw AI Decision Data"):
+            raw_cols = [c for c in ["order_id", "action", "ai_confidence", "market_regime",
+                                    "trend_direction", "profit", "hold_sec"] if c in df_hist.columns]
+            if raw_cols:
+                st.dataframe(df_hist[raw_cols], use_container_width=True, height=400)
+            else:
+                st.info("No AI decision columns found")
     else:
-        st.info("No closed trades")
+        st.info("No trades found for the selected filters")
 
     # ----- WIN/LOSS DISTRIBUTION -----
     st.markdown("### 📊 Profit Distribution")
@@ -1464,19 +1557,28 @@ elif page == "🤖 AI Models":
                             payload = {
                                 "model": model["model"],
                                 "messages": [{"role": "user", "content": "Say OK"}],
-                                "max_tokens": 10,
+                                "max_tokens": 50,
                                 "temperature": 0.1,
                             }
                             resp = req_lib.post(
                                 model["api_url"],
                                 headers=headers,
                                 json=payload,
-                                timeout=15,
+                                timeout=30,
                             )
                             if resp.status_code == 200:
                                 data = resp.json()
-                                reply = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                                st.success(f"Connection OK! Response: {reply[:100]}")
+                                choices = data.get("choices") or []
+                                if choices:
+                                    raw = choices[0].get("message", {}).get("content", "") or ""
+                                    # Strip <think>...</think> blocks from thinking models
+                                    import re as _re
+                                    reply = _re.sub(r'<think>.*?</think>', '', raw, flags=_re.DOTALL).strip()
+                                    st.success(f"Connection OK! Response: {reply[:100]}")
+                                else:
+                                    err = data.get("error", {})
+                                    err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                                    st.error(f"API error: {err_msg[:200]}")
                             else:
                                 st.error(f"HTTP {resp.status_code}: {resp.text[:200]}")
                         except Exception as e:
@@ -1512,7 +1614,7 @@ elif page == "🤖 AI Models":
             edit_model = st.text_input("Model ID", value=sel["model"])
             edit_url = st.text_input("API URL", value=sel["api_url"])
             edit_key = st.text_input("API Key", value=sel["api_key"], type="password")
-            edit_tokens = st.number_input("Max Tokens", 50, 4096, int(sel["max_tokens"]))
+            edit_tokens = st.number_input("Max Tokens", 50, 32768, int(sel["max_tokens"]))
             edit_temp = st.number_input("Temperature", 0.0, 2.0, float(sel["temperature"]), step=0.05)
             if has_role_col:
                 current_role = sel.get("model_role", "main") or "main"
@@ -1564,7 +1666,7 @@ elif page == "🤖 AI Models":
         new_model = st.text_input("Model ID", placeholder="e.g. deepseek/deepseek-v3.2")
         new_url = st.text_input("API URL", placeholder="https://openrouter.ai/api/v1/chat/completions")
         new_key = st.text_input("API Key", type="password")
-        new_tokens = st.number_input("Max Tokens", 50, 4096, 400, key="new_tokens")
+        new_tokens = st.number_input("Max Tokens", 50, 32768, 400, key="new_tokens")
         new_temp = st.number_input("Temperature", 0.0, 2.0, 0.10, step=0.05, key="new_temp")
         if has_role_col:
             new_role = st.selectbox(
@@ -1731,6 +1833,18 @@ elif page == "🎛️ Bot Control":
             "Max Trades / Day", min_value=1, max_value=100, value=s["max_trades_per_day"]
         )
 
+        st.markdown("##### 🧠 AI Thinking Mode")
+        current_thinking = s.get("ai_thinking", False)
+        new_thinking = st.toggle(
+            "Enable Thinking Mode (Qwen 3.5 / reasoning models)",
+            value=current_thinking,
+            help=(
+                "When ON, AI reasons in <think>...</think> blocks before answering. "
+                "Better trade decisions but uses more tokens and takes longer. "
+                "Works with models like qwen/qwen3.5-122b-a10b."
+            ),
+        )
+
         st.markdown("##### ⏸️ Pause Settings")
         bp_col1, bp_col2 = st.columns(2)
         with bp_col1:
@@ -1753,14 +1867,15 @@ elif page == "🎛️ Bot Control":
                 UPDATE bot_settings
                 SET interval_seconds = %s, max_trades_per_day = %s,
                     pause_max_retries = %s, pause_retry_sec = %s,
-                    scalp_timeframe = %s,
+                    scalp_timeframe = %s, ai_thinking = %s,
                     updated_at = NOW();
                 """,
-                (new_interval, new_max_trades, new_max_retries, new_retry_sec, new_scalp_tf),
+                (new_interval, new_max_trades, new_max_retries, new_retry_sec, new_scalp_tf, new_thinking),
             )
+            thinking_str = "ON" if new_thinking else "OFF"
             run_command(
                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
-                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, scalp_tf={new_scalp_tf}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
+                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, scalp_tf={new_scalp_tf}, thinking={thinking_str}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
             )
             st.success("✅ Settings saved!")
             st.rerun()
@@ -1816,6 +1931,189 @@ elif page == "🎛️ Bot Control":
         | **M30** | 10 min (600s) | Short swing |
         | **H1** | 15-30 min | Swing / Position |
         """
+    )
+
+    st.divider()
+
+    # ==========================================
+    # 🧹 DATA MANAGEMENT (Clean trade data for fresh start)
+    # ==========================================
+    st.markdown("### 🧹 Data Management")
+    st.markdown(
+        '<p class="text-muted">Clean trade data to start fresh (e.g. after switching symbol). '
+        'All <b>settings</b> (bot_settings, ai_model_config) are <b>preserved</b>.</p>',
+        unsafe_allow_html=True,
+    )
+
+    def _get_redis_conn():
+        """Get Redis connection for cache cleanup."""
+        try:
+            r = redis_lib.Redis(
+                host=os.getenv("REDIS_HOST", "redis"),
+                port=int(os.getenv("REDIS_PORT", 6379)),
+                decode_responses=True,
+            )
+            r.ping()
+            return r
+        except Exception:
+            return None
+
+    def _clean_trade_data():
+        """Truncate all trade-related tables (preserve settings)."""
+        run_command(
+            """
+            TRUNCATE TABLE trades,
+                           trade_analysis,
+                           daily_performance,
+                           ai_analysis_log,
+                           api_usage_log
+            CASCADE;
+            """
+        )
+        # Reset confidence_calibration counters (keep rows 1-10)
+        run_command(
+            """
+            UPDATE confidence_calibration
+            SET total_trades = 0, wins = 0, actual_win_rate = 0, avg_profit = 0,
+                updated_at = NOW();
+            """
+        )
+        # Reset signal_reliability counters (keep signal names)
+        run_command(
+            """
+            UPDATE signal_reliability
+            SET times_correct = 0, times_wrong = 0, reliability_pct = 50,
+                updated_at = NOW();
+            """
+        )
+
+    def _clean_event_logs():
+        """Truncate bot_events table."""
+        run_command("TRUNCATE TABLE bot_events;")
+
+    def _clean_redis_cache():
+        """Flush all Redis keys (journal, knowledge, cache)."""
+        r = _get_redis_conn()
+        if r:
+            r.flushdb()
+            return True
+        return False
+
+    def _get_table_counts() -> dict:
+        """Get row counts for data tables."""
+        rows = run_query(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM trades) AS trades,
+                (SELECT COUNT(*) FROM ai_analysis_log) AS ai_logs,
+                (SELECT COUNT(*) FROM bot_events) AS events,
+                (SELECT COUNT(*) FROM api_usage_log) AS api_logs,
+                (SELECT COUNT(*) FROM trade_analysis) AS analyses,
+                (SELECT COUNT(*) FROM daily_performance) AS daily_perf;
+            """
+        )
+        return rows[0] if rows else {}
+
+    # Show current data sizes
+    counts = _get_table_counts()
+    if counts:
+        dc1, dc2, dc3, dc4, dc5, dc6 = st.columns(6)
+        dc1.metric("Trades", f"{counts.get('trades', 0):,}")
+        dc2.metric("AI Logs", f"{counts.get('ai_logs', 0):,}")
+        dc3.metric("Events", f"{counts.get('events', 0):,}")
+        dc4.metric("API Logs", f"{counts.get('api_logs', 0):,}")
+        dc5.metric("Analyses", f"{counts.get('analyses', 0):,}")
+        dc6.metric("Daily Perf", f"{counts.get('daily_perf', 0):,}")
+
+    # Redis status
+    r_conn = _get_redis_conn()
+    redis_keys = 0
+    if r_conn:
+        redis_keys = r_conn.dbsize()
+    st.markdown(f"**Redis Cache:** {redis_keys} keys" if r_conn else "**Redis:** ❌ Not connected")
+
+    st.markdown("---")
+
+    # Individual cleanup buttons
+    clean_col1, clean_col2, clean_col3 = st.columns(3)
+
+    with clean_col1:
+        st.markdown("##### 📊 Trade Data")
+        st.caption("trades, trade_analysis, daily_performance, ai_analysis_log, api_usage_log, confidence & signal calibration")
+        if st.button("🗑️ Clean Trade Data", use_container_width=True):
+            st.session_state["confirm_clean"] = "trades"
+
+    with clean_col2:
+        st.markdown("##### 📋 Event Logs")
+        st.caption("bot_events (start/stop/config change history)")
+        if st.button("🗑️ Clean Event Logs", use_container_width=True):
+            st.session_state["confirm_clean"] = "events"
+
+    with clean_col3:
+        st.markdown("##### 🔴 Redis Cache")
+        st.caption("Market journal, knowledge, analysis cache")
+        if st.button("🗑️ Clean Redis Cache", use_container_width=True):
+            st.session_state["confirm_clean"] = "redis"
+
+    st.markdown("")
+
+    # Clean ALL button
+    if st.button("🧹 CLEAN EVERYTHING (Fresh Start)", type="primary", use_container_width=True):
+        st.session_state["confirm_clean"] = "all"
+
+    # Confirmation dialog
+    pending = st.session_state.get("confirm_clean", "")
+    if pending:
+        labels = {
+            "trades": "all trade data (trades, analyses, AI logs, API logs, calibration)",
+            "events": "all event logs",
+            "redis": "all Redis cache data",
+            "all": "ALL data (trades + events + Redis cache)",
+        }
+        st.warning(f"⚠️ You are about to **permanently delete** {labels.get(pending, pending)}. "
+                   "Bot settings and AI model config will be preserved.")
+
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            if st.button("✅ YES — Delete Now", type="primary", use_container_width=True):
+                cleaned = []
+                try:
+                    if pending in ("trades", "all"):
+                        _clean_trade_data()
+                        cleaned.append("trade data")
+                    if pending in ("events", "all"):
+                        _clean_event_logs()
+                        cleaned.append("event logs")
+                    if pending in ("redis", "all"):
+                        ok = _clean_redis_cache()
+                        if ok:
+                            cleaned.append("Redis cache")
+                        else:
+                            cleaned.append("Redis (skipped — not connected)")
+
+                    # Log the cleanup action
+                    run_command(
+                        "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
+                        ("DATA_CLEANUP", f"Cleaned: {', '.join(cleaned)}"),
+                    )
+                except Exception as e:
+                    st.error(f"❌ Cleanup failed: {e}")
+                else:
+                    st.session_state.pop("confirm_clean", None)
+                    st.success(f"✅ Cleaned: {', '.join(cleaned)}")
+                    st.rerun()
+        with confirm_col2:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state.pop("confirm_clean", None)
+                st.rerun()
+
+    st.divider()
+    st.markdown(
+        '<p class="text-muted">💡 <b>Tip:</b> To also clean Docker container logs and free disk space, '
+        'run on your server:<br><code>docker compose logs --no-log-prefix trader 2>/dev/null | wc -l</code> '
+        '(check size) then <code>sudo truncate -s 0 $(docker inspect --format=\'\'{{.LogPath}}\'\' '
+        'trade-trader-1)</code> for each container.</p>',
+        unsafe_allow_html=True,
     )
 
 
@@ -2195,7 +2493,7 @@ if not _forecast_model_str:
 
 st.sidebar.markdown(f"""
 <div class="text-muted">
-{_main_model_str}{_forecast_model_str}<b class="gold-accent">Symbol:</b> XAUUSD
+{_main_model_str}{_forecast_model_str}<b class="gold-accent">Symbol:</b> {_SYMBOL}
 </div>
 """, unsafe_allow_html=True)
-st.sidebar.caption(f"AI Gold Trader v2.1 Enterprise • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.sidebar.caption(f"AI Trader v2.2 Enterprise • {datetime.now().strftime('%Y-%m-%d %H:%M')}")
