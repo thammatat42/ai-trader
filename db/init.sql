@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     pause_max_retries   INTEGER   NOT NULL DEFAULT 5,     -- จำนวนครั้ง retry ขณะ BREAKPOINT (0 = retry ไม่จำกัด)
     pause_retry_sec     INTEGER   NOT NULL DEFAULT 10,    -- เวลา (วินาที) ระหว่าง retry ขณะ BREAKPOINT
     scalp_timeframe     VARCHAR(10) NOT NULL DEFAULT 'M15',  -- M1/M5/M15/M30
+    data_cleaned_at     TIMESTAMP,                        -- When trade data was last cleaned (sync filter)
     updated_at          TIMESTAMP DEFAULT NOW()
 );
 

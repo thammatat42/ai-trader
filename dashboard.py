@@ -331,13 +331,23 @@ def sync_mt5_to_db():
     Sync data from MT5 to trades table in PostgreSQL.
     - /positions -> UPSERT as OPEN trades
     - /history   -> UPSERT as CLOSED trades
+    Respects data_cleaned_at: skips deals closed before that timestamp.
     """
     synced = 0
+
+    # Get data_cleaned_at cutoff (skip old deals after a data cleanup)
+    _cutoff_row = run_query(
+        "SELECT EXTRACT(EPOCH FROM data_cleaned_at) AS ts FROM bot_settings LIMIT 1;"
+    )
+    _cutoff_ts = float(_cutoff_row[0]["ts"]) if _cutoff_row and _cutoff_row[0] and _cutoff_row[0]["ts"] else 0
 
     # --- Sync Open Positions ---
     pos_data = mt5_api("/positions")
     if pos_data and pos_data.get("positions"):
         for p in pos_data["positions"]:
+            # Skip positions opened before cleanup
+            if _cutoff_ts and p.get("time", 0) < _cutoff_ts:
+                continue
             try:
                 run_command(
                     """
@@ -377,6 +387,9 @@ def sync_mt5_to_db():
             in_deal = in_deals.get(pos_id, {})
             open_price = in_deal.get("price")
             open_time = in_deal.get("time", out_deal["time"])
+            # Skip deals from before data cleanup
+            if _cutoff_ts and out_deal["time"] < _cutoff_ts:
+                continue
             # DB order_id = opening order (IN deal's order)
             db_order_id = in_deal.get("order", out_deal["order"])
             # action = direction of the original open deal
@@ -1963,31 +1976,35 @@ elif page == "🎛️ Bot Control":
 
     def _clean_trade_data():
         """Truncate all trade-related tables (preserve settings)."""
+        # Truncate core tables (always exist)
+        run_command("TRUNCATE TABLE trades, ai_analysis_log, api_usage_log CASCADE;")
+
+        # Truncate learning tables (may not exist if migration not run)
+        for tbl in ("trade_analysis", "daily_performance"):
+            try:
+                run_command(f"TRUNCATE TABLE {tbl} CASCADE;")
+            except Exception:
+                pass
+
+        # Reset calibration counters (may not exist)
+        try:
+            run_command(
+                "UPDATE confidence_calibration "
+                "SET total_trades = 0, wins = 0, actual_win_rate = 0, avg_profit = 0, updated_at = NOW();"
+            )
+        except Exception:
+            pass
+        try:
+            run_command(
+                "UPDATE signal_reliability "
+                "SET times_correct = 0, times_wrong = 0, reliability_pct = 50, updated_at = NOW();"
+            )
+        except Exception:
+            pass
+
+        # Set data_cleaned_at so MT5 sync won't re-import old trades
         run_command(
-            """
-            TRUNCATE TABLE trades,
-                           trade_analysis,
-                           daily_performance,
-                           ai_analysis_log,
-                           api_usage_log
-            CASCADE;
-            """
-        )
-        # Reset confidence_calibration counters (keep rows 1-10)
-        run_command(
-            """
-            UPDATE confidence_calibration
-            SET total_trades = 0, wins = 0, actual_win_rate = 0, avg_profit = 0,
-                updated_at = NOW();
-            """
-        )
-        # Reset signal_reliability counters (keep signal names)
-        run_command(
-            """
-            UPDATE signal_reliability
-            SET times_correct = 0, times_wrong = 0, reliability_pct = 50,
-                updated_at = NOW();
-            """
+            "UPDATE bot_settings SET data_cleaned_at = NOW(), updated_at = NOW();"
         )
 
     def _clean_event_logs():

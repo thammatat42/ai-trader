@@ -1061,7 +1061,12 @@ def analyze_closed_trade(trade_row: dict) -> dict | None:
     try:
         resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=30 if thinking else 15)
         resp.raise_for_status()
-        reply = _strip_thinking(resp.json()["choices"][0]["message"]["content"].strip())
+        resp_data = resp.json()
+        choices = resp_data.get("choices") or []
+        if not choices:
+            print(f"[POST-ANALYSIS] ⚠️ No choices: {str(resp_data.get('error', ''))[:200]}")
+            return None
+        reply = _strip_thinking(choices[0]["message"]["content"].strip())
 
         # Parse JSON from response
         json_match = re.search(r'\{.*\}', reply, re.DOTALL)
@@ -1905,7 +1910,12 @@ def analyze_with_ai(price_data, technical_summary: str = "",
                 total_tokens=usage.get("total_tokens", 0),
                 response_time_ms=elapsed, status="OK",
             )
-            raw = resp_json["choices"][0]["message"]["content"].strip()
+            choices = resp_json.get("choices") or []
+            if not choices:
+                err = resp_json.get("error", {})
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                raise ValueError(f"No choices in response: {err_msg[:200]}")
+            raw = choices[0]["message"]["content"].strip()
             return _strip_thinking(raw)
         except Exception as e:
             elapsed = int((time.time() - t_start) * 1000)
@@ -1999,6 +2009,20 @@ def sync_closed_trades():
     if not windows_ip:
         return
 
+    # Get data_cleaned_at cutoff (skip deals before cleanup timestamp)
+    _cutoff_ts = 0
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT EXTRACT(EPOCH FROM data_cleaned_at) FROM bot_settings LIMIT 1;")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row[0]:
+            _cutoff_ts = float(row[0])
+    except Exception:
+        pass
+
     try:
         resp  = http_session.get(f"http://{windows_ip}:8000/history?days=7", timeout=10)
         resp.raise_for_status()
@@ -2018,6 +2042,9 @@ def sync_closed_trades():
             cur     = conn.cursor()
             updated = 0
             for pos_id, out_deal in out_deals.items():
+                # Skip deals from before data cleanup
+                if _cutoff_ts and out_deal.get("time", 0) < _cutoff_ts:
+                    continue
                 in_deal     = in_deals.get(pos_id)
                 db_order_id = in_deal["order"] if in_deal else pos_id
                 cur.execute(
@@ -2338,7 +2365,10 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
             total_tokens=usage.get("total_tokens", 0),
             response_time_ms=elapsed, status="OK_FORECAST",
         )
-        reply = _strip_thinking(resp_json["choices"][0]["message"]["content"].strip()).upper()
+        reply_raw = _strip_thinking((resp_json.get("choices") or [{}])[0].get("message", {}).get("content", "")).strip().upper()
+        if not reply_raw:
+            raise ValueError(f"Empty forecast response: {str(resp_json.get('error', ''))[:200]}")
+        reply = reply_raw
         # Reset forecast failure counter on success
         _forecast_failures.clear()
         if "CLOSE" in reply:
