@@ -470,6 +470,40 @@ def build_technical_summary(candles_h1: list, candles_h4: list, candles_d1: list
             for c in last4
         )
 
+        # Candle pattern detection on last 2 candles
+        patterns_found = []
+        for ci in range(-2, 0):
+            c = candles[ci]
+            high, low, opn, cls = c["high"], c["low"], c["open"], c["close"]
+            body = abs(cls - opn)
+            full_range = high - low
+            if full_range < 1e-8:
+                continue
+            body_ratio = body / full_range
+            upper_wick = high - max(opn, cls)
+            lower_wick = min(opn, cls) - low
+            is_bull = cls > opn
+            pos = "last" if ci == -1 else "prev"
+            # Doji: tiny body
+            if body_ratio < 0.1:
+                patterns_found.append(f"Doji({pos})")
+            # Hammer: small body at top, long lower wick (bullish reversal)
+            elif lower_wick > body * 2 and upper_wick < body * 0.5:
+                patterns_found.append(f"Hammer({pos})" if is_bull else f"InvHammer({pos})")
+            # Shooting Star: small body at bottom, long upper wick (bearish reversal)
+            elif upper_wick > body * 2 and lower_wick < body * 0.5:
+                patterns_found.append(f"ShootingStar({pos})")
+        # Engulfing: current candle body fully engulfs previous
+        if len(candles) >= 2:
+            prev_c, curr_c = candles[-2], candles[-1]
+            prev_body = abs(prev_c["close"] - prev_c["open"])
+            curr_body = abs(curr_c["close"] - curr_c["open"])
+            if curr_body > prev_body * 1.2 and prev_body > 0:
+                if curr_c["close"] > curr_c["open"] and prev_c["close"] < prev_c["open"]:
+                    patterns_found.append("BullEngulf")
+                elif curr_c["close"] < curr_c["open"] and prev_c["close"] > prev_c["open"]:
+                    patterns_found.append("BearEngulf")
+
         parts = [
             f"[{label}] Close={current:.2f}",
             f"EMA9={ema_9:.2f} EMA21={ema_21:.2f} SMA20={sma_20:.2f}",
@@ -485,6 +519,8 @@ def build_technical_summary(candles_h1: list, candles_h4: list, candles_d1: list
             f"Support={sr['support']} Resist={sr['resistance']}",
             f"Last4: {candle_summary}",
         ])
+        if patterns_found:
+            parts.append(f"Patterns: {', '.join(patterns_found)}")
         lines.append(" | ".join(parts))
 
     return "\n".join(lines)
@@ -1415,7 +1451,7 @@ def parse_sentiment(ai_text: str) -> str:
     lines = [l.strip() for l in ai_text.strip().split("\n") if l.strip()]
 
     # Primary: parse "Sentiment: Bullish/Bearish/Neutral" from structured output
-    for line in lines[:4]:                        # check first 4 lines only
+    for line in lines[:6]:                        # check first 6 lines (includes Thought: line)
         line_l = line.lower()
         if line_l.startswith("sentiment"):
             if "bullish" in line_l:
@@ -1732,7 +1768,8 @@ def _get_ai_config(role: str = "main") -> dict:
 def analyze_with_ai(price_data, technical_summary: str = "",
                     orderbook_summary: str = "", news_summary: str = "",
                     journal_history: str = "", journal_knowledge: str = "",
-                    trade_history: str = "", scalp_tf: str = "M5") -> str:
+                    trade_history: str = "", scalp_tf: str = "M5",
+                    d1_high: float = None, d1_low: float = None) -> str:
     ai_cfg = _get_ai_config("main")
     api_key = ai_cfg["api_key"]
     url     = ai_cfg["url"]
@@ -1807,6 +1844,9 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "Counter-trend trades need overwhelming evidence (confidence 8+).\n"
         "3. Support/Resistance proximity: Do NOT BUY near resistance or SELL near support "
         "unless a breakout is confirmed by volume + momentum.\n"
+        "3b. DAILY HIGH/LOW: These are key liquidity zones. "
+        "Do NOT BUY within 0.3% of Daily High (trapped longs) or SELL within 0.3% of Daily Low (trapped shorts) "
+        "unless a clear breakout with momentum is confirmed.\n"
         "4. Consider the FULL picture: technicals + trade history + news + patterns. "
         "Do not base decisions on a single indicator.\n"
         "5. WAIT is your best friend. If you are unsure, WAIT. "
@@ -1848,6 +1888,7 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         "Saying WAIT when unsure is a winning decision.\n\n"
 
         "Reply EXACTLY in this format (no extra text, no preamble):\n"
+        "Thought: <1-2 sentences: step-by-step reasoning — what signals you see for/against each direction>\n"
         "Sentiment: <Bullish/Bearish/Neutral>\n"
         "Confidence: <1-10>\n"
         "Reason: <2-3 sentences: key signals, trend alignment, and risk factors>"
@@ -1858,6 +1899,15 @@ def analyze_with_ai(price_data, technical_summary: str = "",
         f"Current Price -> Bid: {price_data['bid']}, Ask: {price_data['ask']}",
         f"Spread: {round(price_data['ask'] - price_data['bid'], 2)}",
     ]
+    if d1_high is not None and d1_low is not None:
+        mid = (price_data['bid'] + price_data['ask']) / 2
+        pct_from_high = abs(d1_high - mid) / mid * 100 if mid else 0
+        pct_from_low  = abs(mid - d1_low) / mid * 100 if mid else 0
+        sections.append(
+            f"\n=== DAILY RANGE (Liquidity Zones) ==="
+            f"\nD1 High: {d1_high:.2f} ({pct_from_high:.2f}% away) | "
+            f"D1 Low: {d1_low:.2f} ({pct_from_low:.2f}% away)"
+        )
     if technical_summary:
         sections.append(f"\n=== TECHNICAL ANALYSIS (Multi-Timeframe) ===\n{technical_summary}")
     if orderbook_summary:
@@ -2891,6 +2941,8 @@ MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.5))
 # Minimum seconds between new trade entries (prevent over-trading)
 MIN_TRADE_INTERVAL_SEC = int(os.getenv("MIN_TRADE_INTERVAL_SEC", 120))
 _last_trade_ts: float = 0.0
+_last_analysis_price: float = 0.0   # For price-event trigger
+PRICE_EVENT_PCT = float(os.getenv("PRICE_EVENT_PCT", 0.2))  # % move to trigger re-analysis
 
 
 def get_trend_alignment(candles_h1: list, candles_h4: list, candles_d1: list) -> dict:
@@ -3524,6 +3576,14 @@ def main_loop():
             except Exception as e:
                 print(f"[RAG] ⚠️ Failed to build RAG context: {e}")
 
+            # Extract D1 High/Low as liquidity zones
+            d1_high_val = None
+            d1_low_val  = None
+            if candles_d1 and len(candles_d1) >= 2:
+                recent_d1 = candles_d1[-2:]  # yesterday + today
+                d1_high_val = max(c["high"] for c in recent_d1)
+                d1_low_val  = min(c["low"]  for c in recent_d1)
+
             analysis = analyze_with_ai(
                 price, tech_summary,
                 orderbook_summary=ob_summary,
@@ -3532,6 +3592,8 @@ def main_loop():
                 journal_knowledge=(j_knowledge + extra_knowledge) if extra_knowledge else j_knowledge,
                 trade_history=trade_log_summary,
                 scalp_tf=scalp_tf,
+                d1_high=d1_high_val,
+                d1_low=d1_low_val,
             )
             print(f"\n>>> 🤖 AI RESULT <<<\n{analysis}\n{'='*30}")
 
@@ -3687,6 +3749,10 @@ def main_loop():
             journal_save_analysis(action, analysis, confidence, bid, ask, tech_summary)
             journal_detect_patterns()
 
+            # Record price for price-event trigger
+            global _last_analysis_price
+            _last_analysis_price = (bid + ask) / 2
+
             sync_closed_trades()
             consecutive_errors = 0
 
@@ -3710,12 +3776,26 @@ def main_loop():
                     pass
                 break
 
-        # ---- Wait interval (chunked for graceful shutdown) ----
+        # ---- Wait interval (chunked for graceful shutdown + price event trigger) ----
         print(f"⏳ Waiting {interval}s before next cycle...")
         waited = 0
         while waited < interval and not _shutdown:
             time.sleep(min(5, interval - waited))
             waited += 5
+            # Price Event Trigger: if price moved significantly, re-analyze early
+            if waited < interval and _last_analysis_price > 0 and waited >= 10:
+                try:
+                    _pe_price = get_price_from_mt5()
+                    if _pe_price and "error" not in _pe_price:
+                        _pe_mid = (_pe_price["bid"] + _pe_price["ask"]) / 2
+                        _pe_pct = abs(_pe_mid - _last_analysis_price) / _last_analysis_price * 100
+                        if _pe_pct >= PRICE_EVENT_PCT:
+                            print(f"[PRICE EVENT] ⚡ Price moved {_pe_pct:.2f}% "
+                                  f"({_last_analysis_price:.2f} → {_pe_mid:.2f}) → immediate re-analysis")
+                            log_event("PRICE_EVENT", f"Price moved {_pe_pct:.2f}%: {_last_analysis_price:.2f}→{_pe_mid:.2f}")
+                            break
+                except Exception:
+                    pass
 
     log_event("STOP", "AI Trader service stopped")
     print("👋 System shut down successfully")
