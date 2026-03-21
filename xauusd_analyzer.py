@@ -3654,32 +3654,37 @@ def main_loop():
 
             # ---- S/R Room-to-Move filter ----
             # Don't enter if there's not enough room to reach TP before hitting S/R
+            # Crypto: 40% room required (H1 S/R ranges are tighter vs ATR-based TP)
+            # Gold:   60% room required (standard)
             if action in ("BUY", "SELL") and candles_h1 and len(candles_h1) >= 20:
                 sr_h1 = calc_support_resistance(candles_h1, 20)
                 if sr_h1:
                     current_mid = (bid + ask) / 2
                     tp_distance_usd = tp_points * POINT_SIZE  # convert points to USD
+                    _sr_room_pct = 0.4 if _is_crypto_symbol() else 0.6
+                    _sr_override_conf = 7 if _is_crypto_symbol() else 8
+                    _sr_room_label = f"{int(_sr_room_pct * 100)}%"
                     if action == "BUY":
                         room_to_resist = sr_h1["resistance"] - current_mid
-                        if room_to_resist < tp_distance_usd * 0.6:
+                        if room_to_resist < tp_distance_usd * _sr_room_pct:
                             confidence = _extract_confidence(analysis)
-                            if confidence < 8:
+                            if confidence < _sr_override_conf:
                                 print(
                                     f"[S/R] ⚠️ BUY blocked: only ${room_to_resist:.2f} room to resistance "
-                                    f"{sr_h1['resistance']}, need ${tp_distance_usd * 0.6:.2f} (60% of TP), conf={confidence} → WAIT"
+                                    f"{sr_h1['resistance']}, need ${tp_distance_usd * _sr_room_pct:.2f} ({_sr_room_label} of TP), conf={confidence} → WAIT"
                                 )
-                                log_event("SR_FILTER", f"BUY blocked: room={room_to_resist:.2f} < TP*0.6={tp_distance_usd*0.6:.2f}")
+                                log_event("SR_FILTER", f"BUY blocked: room={room_to_resist:.2f} < TP*{_sr_room_pct}={tp_distance_usd*_sr_room_pct:.2f}")
                                 action = "WAIT"
                     elif action == "SELL":
                         room_to_support = current_mid - sr_h1["support"]
-                        if room_to_support < tp_distance_usd * 0.6:
+                        if room_to_support < tp_distance_usd * _sr_room_pct:
                             confidence = _extract_confidence(analysis)
-                            if confidence < 8:
+                            if confidence < _sr_override_conf:
                                 print(
                                     f"[S/R] ⚠️ SELL blocked: only ${room_to_support:.2f} room to support "
-                                    f"{sr_h1['support']}, need ${tp_distance_usd * 0.6:.2f} (60% of TP), conf={confidence} → WAIT"
+                                    f"{sr_h1['support']}, need ${tp_distance_usd * _sr_room_pct:.2f} ({_sr_room_label} of TP), conf={confidence} → WAIT"
                                 )
-                                log_event("SR_FILTER", f"SELL blocked: room={room_to_support:.2f} < TP*0.6={tp_distance_usd*0.6:.2f}")
+                                log_event("SR_FILTER", f"SELL blocked: room={room_to_support:.2f} < TP*{_sr_room_pct}={tp_distance_usd*_sr_room_pct:.2f}")
                                 action = "WAIT"
 
             # ---- Direction Bias filter ----
