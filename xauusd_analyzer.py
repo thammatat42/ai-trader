@@ -2246,8 +2246,11 @@ def modify_sl_mt5(ticket: int, new_sl: float, new_tp: float = None) -> bool:
 def ai_quick_forecast(candles_scalp: list, current_price: float,
                       position_type: str, profit: float,
                       scalp_tf: str = "M15",
-                      open_price: float = 0, hold_sec: int = 0) -> dict:
-    """Enhanced AI forecast with multi-indicator context + S/R + trend."""
+                      open_price: float = 0, hold_sec: int = 0,
+                      news_alert: str = "",
+                      trend_summary: str = "",
+                      win_rate_summary: str = "") -> dict:
+    """Enhanced AI forecast with multi-indicator context + S/R + trend + news + lessons."""
     if not candles_scalp or len(candles_scalp) < 10:
         return {"action": "CLOSE", "reason": f"Insufficient {scalp_tf} data"}
 
@@ -2334,12 +2337,24 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
     if sr:
         indicators.append(f"Support={sr['support']:.2f} Resist={sr['resistance']:.2f}")
 
+    # Add compact context lines (news, trend, performance) — keeps prompt small
+    extra_lines = []
+    if news_alert:
+        extra_lines.append(f"⚠️ NEWS: {news_alert}")
+    if trend_summary:
+        extra_lines.append(f"H1 Trend: {trend_summary}")
+    if win_rate_summary:
+        extra_lines.append(f"Recent: {win_rate_summary}")
+    extra_ctx = "\n".join(extra_lines)
+
     compact_prompt = (
         f"{_sym} {scalp_tf} candles: {candle_str}\n"
         f"{' | '.join(indicators)}\n"
         f"Position: {position_type} | Profit=${profit:+.2f} | Hold={hold_sec}s\n"
-        f"Question: Should this {position_type} position be held or closed NOW?\n"
-        f"Consider: momentum direction, indicator alignment, S/R proximity, risk of reversal.\n"
+        + (f"{extra_ctx}\n" if extra_ctx else "")
+        + f"Question: Should this {position_type} position be held or closed NOW?\n"
+        f"Consider: momentum, indicators, S/R, risk of reversal"
+        + (", news impact" if news_alert else "") + ".\n"
         f"Reply format: HOLD or CLOSE — then max 10 words reason."
     )
 
@@ -2585,10 +2600,45 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
             candles_scalp = get_candles_from_mt5(scalp_tf, 30)
 
+            # --- Gather compact context for forecast (cached per monitor cycle) ---
+            if not hasattr(smart_position_monitor, "_fc_ctx") or smart_position_monitor._fc_ts != now_ts:
+                _fc_news = ""
+                _fc_trend = ""
+                _fc_wr = ""
+                try:
+                    news_imm, news_ev = is_high_impact_news_imminent(window_min=30)
+                    if news_imm:
+                        _fc_news = f"High-impact: {news_ev} within 30min — volatility risk"
+                except Exception:
+                    pass
+                try:
+                    ch1 = get_candles_from_mt5("H1", 30)
+                    ch4 = get_candles_from_mt5("H4", 30)
+                    if ch1 and ch4:
+                        cl_h1 = [c["close"] for c in ch1]
+                        cl_h4 = [c["close"] for c in ch4]
+                        e9_h1, e21_h1 = calc_ema(cl_h1, 9), calc_ema(cl_h1, 21)
+                        e9_h4, e21_h4 = calc_ema(cl_h4, 9), calc_ema(cl_h4, 21)
+                        h1d = "UP" if e9_h1 and e21_h1 and e9_h1 > e21_h1 else "DOWN" if e9_h1 and e21_h1 else "?"
+                        h4d = "UP" if e9_h4 and e21_h4 and e9_h4 > e21_h4 else "DOWN" if e9_h4 and e21_h4 else "?"
+                        _fc_trend = f"H1={h1d} H4={h4d}"
+                except Exception:
+                    pass
+                try:
+                    ws = get_recent_win_rate(3)
+                    if ws["total"] >= 3:
+                        _fc_wr = f"{ws['win_rate']}% WR ({ws['wins']}W/{ws['losses']}L) P/L=${ws['total_profit']}"
+                except Exception:
+                    pass
+                smart_position_monitor._fc_ctx = (_fc_news, _fc_trend, _fc_wr)
+                smart_position_monitor._fc_ts = now_ts
+            _fc_news, _fc_trend, _fc_wr = smart_position_monitor._fc_ctx
+
             if hold_sec >= MAX_HOLD_SEC_LOSS and profit <= 0:
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
+                    news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
                 )
                 print(f"[SMART] ⏰ #{ticket} {hold_sec}s > MAX_LOSS, loss ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
@@ -2599,6 +2649,7 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
+                    news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
                 )
                 print(f"[SMART] 💰 #{ticket} {pos_type} | {hold_sec}s | ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
@@ -2609,6 +2660,7 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
+                    news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
                 )
                 print(f"[SMART] ⚠️ #{ticket} losing ${profit:.2f} at {hold_sec}s | AI: {forecast['action']}")
                 if forecast["action"] == "CLOSE":
