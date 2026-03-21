@@ -1482,12 +1482,14 @@ elif page == "🤖 AI Models":
             am_col3.metric("Model", am["display_name"] or am["model"])
             am_col4.metric("Max Tokens", am["max_tokens"])
             am_col5.metric("Temperature", f"{am['temperature']}")
+            thinking_badge = '🧠 ON' if am.get('ai_thinking') else '⚪ OFF'
             st.markdown(
                 f"""<div class="card-panel">
                 <h4>{role_emoji} {role_label} — {am['display_name'] or am['model']}</h4>
                 <b>Model:</b> {am['model']}<br>
                 <b>API URL:</b> {am['api_url']}<br>
             <b>API Key:</b> {'*' * 8 + am['api_key'][-4:] if len(am['api_key']) > 4 else '***'}<br>
+            <b>Thinking Mode:</b> {thinking_badge}<br>
             <b>Last Updated:</b> {am['updated_at'].strftime('%Y-%m-%d %H:%M') if am['updated_at'] else 'N/A'}
             </div>""",
             unsafe_allow_html=True,
@@ -1511,11 +1513,12 @@ elif page == "🤖 AI Models":
                 role_str = model.get("model_role", "main").upper() if has_role_col else ""
                 role_badge = f" [{role_str}]" if role_str else ""
                 display = model["display_name"] or model["model"]
+                thinking_str = " | 🧠 Thinking" if model.get("ai_thinking") else ""
                 st.markdown(
                     f"""<div class="card-panel">
                     <h4>{display}{role_badge} <span style="font-size:0.8rem;">{active_badge}</span></h4>
                     <span class="text-muted">Provider: {model['provider']} | Model: {model['model']} |
-                    Tokens: {model['max_tokens']} | Temp: {model['temperature']}</span>
+                    Tokens: {model['max_tokens']} | Temp: {model['temperature']}{thinking_str}</span>
                     </div>""",
                     unsafe_allow_html=True,
                 )
@@ -1616,6 +1619,11 @@ elif page == "🤖 AI Models":
             edit_key = st.text_input("API Key", value=sel["api_key"], type="password")
             edit_tokens = st.number_input("Max Tokens", 50, 32768, int(sel["max_tokens"]))
             edit_temp = st.number_input("Temperature", 0.0, 2.0, float(sel["temperature"]), step=0.05)
+            edit_thinking = st.toggle(
+                "🧠 Enable Thinking Mode",
+                value=sel.get("ai_thinking", False),
+                help="Enable <think>...</think> reasoning (Qwen 3.5 / reasoning models). Uses more tokens but better decisions.",
+            )
             if has_role_col:
                 current_role = sel.get("model_role", "main") or "main"
                 edit_role = st.selectbox(
@@ -1635,11 +1643,12 @@ elif page == "🤖 AI Models":
                         UPDATE ai_model_config
                         SET display_name = %s, provider = %s, model = %s,
                             api_url = %s, api_key = %s, max_tokens = %s,
-                            temperature = %s, model_role = %s, notes = %s, updated_at = NOW()
+                            temperature = %s, model_role = %s, ai_thinking = %s,
+                            notes = %s, updated_at = NOW()
                         WHERE id = %s;
                         """,
                         (edit_display, edit_provider, edit_model, edit_url, edit_key,
-                         edit_tokens, edit_temp, edit_role, edit_notes, sel["id"]),
+                         edit_tokens, edit_temp, edit_role, edit_thinking, edit_notes, sel["id"]),
                     )
                 else:
                     run_command(
@@ -1647,11 +1656,12 @@ elif page == "🤖 AI Models":
                         UPDATE ai_model_config
                         SET display_name = %s, provider = %s, model = %s,
                             api_url = %s, api_key = %s, max_tokens = %s,
-                            temperature = %s, notes = %s, updated_at = NOW()
+                            temperature = %s, ai_thinking = %s,
+                            notes = %s, updated_at = NOW()
                         WHERE id = %s;
                         """,
                         (edit_display, edit_provider, edit_model, edit_url, edit_key,
-                         edit_tokens, edit_temp, edit_notes, sel["id"]),
+                         edit_tokens, edit_temp, edit_thinking, edit_notes, sel["id"]),
                     )
                 st.success(f"Updated: {edit_display or edit_model}")
                 st.rerun()
@@ -1668,6 +1678,12 @@ elif page == "🤖 AI Models":
         new_key = st.text_input("API Key", type="password")
         new_tokens = st.number_input("Max Tokens", 50, 32768, 400, key="new_tokens")
         new_temp = st.number_input("Temperature", 0.0, 2.0, 0.10, step=0.05, key="new_temp")
+        new_thinking = st.toggle(
+            "🧠 Enable Thinking Mode",
+            value=False,
+            key="new_thinking",
+            help="Enable <think>...</think> reasoning (Qwen 3.5 / reasoning models). Uses more tokens but better decisions.",
+        )
         if has_role_col:
             new_role = st.selectbox(
                 "Model Role",
@@ -1686,22 +1702,22 @@ elif page == "🤖 AI Models":
                         """
                         INSERT INTO ai_model_config
                             (provider, model, api_key, api_url, is_active, display_name,
-                             max_tokens, temperature, model_role, notes)
-                        VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s, %s);
+                             max_tokens, temperature, ai_thinking, model_role, notes)
+                        VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s, %s, %s);
                         """,
                         (new_provider, new_model, new_key, new_url,
-                         new_display or new_model, new_tokens, new_temp, new_role, new_notes),
+                         new_display or new_model, new_tokens, new_temp, new_thinking, new_role, new_notes),
                     )
                 else:
                     run_command(
                         """
                         INSERT INTO ai_model_config
                             (provider, model, api_key, api_url, is_active, display_name,
-                             max_tokens, temperature, notes)
-                        VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s);
+                             max_tokens, temperature, ai_thinking, notes)
+                        VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s, %s);
                         """,
                         (new_provider, new_model, new_key, new_url,
-                         new_display or new_model, new_tokens, new_temp, new_notes),
+                         new_display or new_model, new_tokens, new_temp, new_thinking, new_notes),
                     )
                 st.success(f"Added: {new_display or new_model} (role={new_role})")
                 st.rerun()
@@ -1833,18 +1849,6 @@ elif page == "🎛️ Bot Control":
             "Max Trades / Day", min_value=1, max_value=100, value=s["max_trades_per_day"]
         )
 
-        st.markdown("##### 🧠 AI Thinking Mode")
-        current_thinking = s.get("ai_thinking", False)
-        new_thinking = st.toggle(
-            "Enable Thinking Mode (Qwen 3.5 / reasoning models)",
-            value=current_thinking,
-            help=(
-                "When ON, AI reasons in <think>...</think> blocks before answering. "
-                "Better trade decisions but uses more tokens and takes longer. "
-                "Works with models like qwen/qwen3.5-122b-a10b."
-            ),
-        )
-
         st.markdown("##### ⏸️ Pause Settings")
         bp_col1, bp_col2 = st.columns(2)
         with bp_col1:
@@ -1867,15 +1871,14 @@ elif page == "🎛️ Bot Control":
                 UPDATE bot_settings
                 SET interval_seconds = %s, max_trades_per_day = %s,
                     pause_max_retries = %s, pause_retry_sec = %s,
-                    scalp_timeframe = %s, ai_thinking = %s,
+                    scalp_timeframe = %s,
                     updated_at = NOW();
                 """,
-                (new_interval, new_max_trades, new_max_retries, new_retry_sec, new_scalp_tf, new_thinking),
+                (new_interval, new_max_trades, new_max_retries, new_retry_sec, new_scalp_tf),
             )
-            thinking_str = "ON" if new_thinking else "OFF"
             run_command(
                 "INSERT INTO bot_events (event_type, message) VALUES (%s, %s);",
-                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, scalp_tf={new_scalp_tf}, thinking={thinking_str}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
+                ("CONFIG_CHANGE", f"interval={new_interval}s, max_trades={new_max_trades}, scalp_tf={new_scalp_tf}, pause_retries={new_max_retries}, retry_sec={new_retry_sec}s"),
             )
             st.success("✅ Settings saved!")
             st.rerun()

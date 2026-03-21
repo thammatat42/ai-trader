@@ -1054,11 +1054,12 @@ def analyze_closed_trade(trade_row: dict) -> dict | None:
         "max_tokens": 200,
         "temperature": 0.05,
     }
-    if AI_THINKING:
+    thinking = ai_cfg.get("thinking", AI_THINKING)
+    if thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": True}
 
     try:
-        resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=30 if AI_THINKING else 15)
+        resp = http_session.post(ai_cfg["url"], headers=headers, json=payload, timeout=30 if thinking else 15)
         resp.raise_for_status()
         reply = _strip_thinking(resp.json()["choices"][0]["message"]["content"].strip())
 
@@ -1641,7 +1642,8 @@ def _get_ai_config(role: str = "main") -> dict:
         # Try role-specific model first
         cur.execute(
             """
-            SELECT provider, model, api_key, api_url, max_tokens, temperature
+            SELECT provider, model, api_key, api_url, max_tokens, temperature,
+                   COALESCE(ai_thinking, FALSE)
             FROM ai_model_config
             WHERE is_active = TRUE AND model_role = %s
             ORDER BY updated_at DESC
@@ -1654,7 +1656,8 @@ def _get_ai_config(role: str = "main") -> dict:
             # Fallback: if no specific forecast model, use main model
             cur.execute(
                 """
-                SELECT provider, model, api_key, api_url, max_tokens, temperature
+                SELECT provider, model, api_key, api_url, max_tokens, temperature,
+                       COALESCE(ai_thinking, FALSE)
                 FROM ai_model_config
                 WHERE is_active = TRUE AND model_role = 'main'
                 ORDER BY updated_at DESC
@@ -1666,7 +1669,8 @@ def _get_ai_config(role: str = "main") -> dict:
             # Legacy fallback: any active model without role
             cur.execute(
                 """
-                SELECT provider, model, api_key, api_url, max_tokens, temperature
+                SELECT provider, model, api_key, api_url, max_tokens, temperature,
+                       COALESCE(ai_thinking, FALSE)
                 FROM ai_model_config
                 WHERE is_active = TRUE
                 ORDER BY updated_at DESC
@@ -1684,6 +1688,7 @@ def _get_ai_config(role: str = "main") -> dict:
                 "model":       row[1],
                 "max_tokens":  int(row[4])   if row[4] else 400,
                 "temperature": float(row[5]) if row[5] else 0.1,
+                "thinking":    bool(row[6]),
             }
     except Exception:
         pass
@@ -1879,10 +1884,11 @@ def analyze_with_ai(price_data, technical_summary: str = "",
     top_p = os.getenv("TOP_P")
     if top_p:
         payload["top_p"] = float(top_p)
-    if AI_THINKING:
+    thinking = ai_cfg.get("thinking", AI_THINKING)
+    if thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": True}
 
-    ai_timeout = 60 if AI_THINKING else 15
+    ai_timeout = 60 if thinking else 15
     max_retries = 2
     for attempt in range(1, max_retries + 1):
         t_start = time.time()
@@ -2765,20 +2771,19 @@ def check_bot_status():
             "SELECT is_running, interval_seconds, "
             "COALESCE(pause_max_retries, 5), COALESCE(pause_retry_sec, 10), "
             "COALESCE(max_trades_per_day, 10), "
-            "COALESCE(scalp_timeframe, 'M15'), "
-            "COALESCE(ai_thinking, FALSE) "
+            "COALESCE(scalp_timeframe, 'M15') "
             "FROM bot_settings LIMIT 1;"
         )
         row = cur.fetchone()
         cur.close()
         conn.close()
         if row:
-            return bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]), str(row[5]), bool(row[6])
+            return bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4]), str(row[5])
         # No settings row → default STOPPED (must start via Dashboard)
-        return False, 300, 5, 10, 10, "M15", False
+        return False, 300, 5, 10, 10, "M15"
     except Exception as e:
         print(f"[ERROR] Failed to check Bot status: {e}")
-        return False, 60, 5, 10, 10, "M15", False
+        return False, 60, 5, 10, 10, "M15"
 
 
 def get_today_trade_count() -> int:
@@ -3162,11 +3167,7 @@ def main_loop():
         _last_market_log = None
 
         # ---- Dashboard kill switch ----
-        is_running, interval, max_retries, retry_sec, max_trades, scalp_tf, db_thinking = check_bot_status()
-
-        # Update AI_THINKING from dashboard setting
-        global AI_THINKING
-        AI_THINKING = db_thinking or os.getenv("AI_THINKING", "false").lower() in ("true", "1", "yes")
+        is_running, interval, max_retries, retry_sec, max_trades, scalp_tf = check_bot_status()
 
         if not is_running:
             pause_retries += 1
