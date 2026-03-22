@@ -3188,7 +3188,7 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
             "Only recommend a trade if you have HIGH confidence (7+).\n"
         )
 
-        # --- Fetch H1 candles for trend ---
+        # --- Fetch multi-TF candles for full analysis ---
         candle_resp = http_session.get(
             f"http://{windows_ip}:8000/candles/{symbol}?timeframe=H1&count=30", timeout=15
         )
@@ -3203,9 +3203,34 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
         ema21 = sum(closes[-21:]) / 21 if len(closes) >= 21 else sum(closes) / len(closes)
         trend_dir = "BUY" if ema9 > ema21 else "SELL"
 
-        # --- AI Analysis ---
+        # Fetch H4 + scalp candles for better analysis
+        try:
+            h4_resp = http_session.get(f"http://{windows_ip}:8000/candles/{symbol}?timeframe=H4&count=30", timeout=15)
+            candles_h4 = h4_resp.json().get("candles", [])
+        except Exception:
+            candles_h4 = []
+        try:
+            scalp_resp = http_session.get(f"http://{windows_ip}:8000/candles/{symbol}?timeframe={scalp_tf}&count=50", timeout=15)
+            candles_scalp = scalp_resp.json().get("candles", [])
+        except Exception:
+            candles_scalp = []
+
+        # Build full technical summary (same quality as normal analysis)
+        tech_summary = build_technical_summary(candles_h1, candles_h4, [], candles_scalp, scalp_tf)
+
+        # Add RAG context + auto-generated lessons for smarter recovery
+        try:
+            rag_context = build_rag_context()
+            if rag_context:
+                loss_context += "\n\n" + rag_context
+            auto_lessons = get_auto_generated_lessons()
+            if auto_lessons:
+                loss_context += "\n\n" + auto_lessons
+        except Exception:
+            pass
+
+        # --- AI Analysis (full context like normal trade) ---
         ai_price_data = {"bid": bid, "ask": ask, "spread": spread}
-        tech_summary = f"Recovery check | H1 EMA9={ema9:.2f} EMA21={ema21:.2f} Trend={trend_dir}"
 
         analysis = analyze_with_ai(
             ai_price_data,
@@ -3266,6 +3291,7 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
         if trade_result and trade_result.get("success"):
             global _last_trade_ts
             _last_trade_ts = time.time()  # Update cooldown timer
+            _loss_pause_at_count = 0  # Reset loss pause tracker — recovery trade can break streak
             _recovery_attempts_recent.append((time.time(), action))
             print(f"[RECOVERY] ✅ Recovery {action} | lot={lot_size} (half-risk) conf={confidence} SL={sl_price} TP={tp_price}")
             log_event("RECOVERY_TRADE", f"{action} lot={lot_size} conf={confidence} after losses")
@@ -3315,7 +3341,7 @@ def main_loop():
     consecutive_errors = 0
     pause_retries      = 0
     _last_market_log   = None
-    _skip_loss_check   = True   # skip loss check on first cycle after startup/redeploy (don't penalize for old losses)
+    _loss_pause_at_count = 999   # loss count already paused for (999 = skip on startup, reset when trade opens)
 
     while not _shutdown:
         # ---- Market hours check ----
@@ -3372,28 +3398,30 @@ def main_loop():
 
         # ---- Consecutive loss pause (with recovery attempt) ----
         LOSS_PAUSE_THRESHOLD = int(os.getenv("LOSS_PAUSE_THRESHOLD", 3))
-        LOSS_PAUSE_SEC       = int(os.getenv("LOSS_PAUSE_SEC",    1800))
+        LOSS_PAUSE_SEC       = int(os.getenv("LOSS_PAUSE_SEC", 1800))
+        # Crypto: short cooldown (3 min) — market moves fast 24/7, long pause = missed opportunity
+        # Gold: longer cooldown (30 min) — session-based, pause until conditions change
+        _pause_sec = 180 if _is_crypto_symbol() else LOSS_PAUSE_SEC
         consec_losses = get_consecutive_losses()
-        if consec_losses >= LOSS_PAUSE_THRESHOLD and not _skip_loss_check:
-            print(f"[SAFETY] ⚠️ {consec_losses} consecutive losses – attempting recovery analysis...")
+        if consec_losses >= LOSS_PAUSE_THRESHOLD and consec_losses > _loss_pause_at_count:
+            # Only pause if losses INCREASED since last pause (prevents repeat pause for same streak)
+            print(f"[SAFETY] ⚠️ {consec_losses} consecutive losses (new since last pause at {_loss_pause_at_count}) – attempting recovery...")
             log_event("LOSS_PAUSE", f"{consec_losses} consecutive losses – running recovery")
             sync_closed_trades()
             # Try recovery trade instead of blind pause
             scalp_tf = os.getenv("SCALP_TIMEFRAME", "M5")
             recovered = attempt_recovery_trade(symbol, scalp_tf)
             if not recovered:
-                print(f"[SAFETY] Recovery declined — pausing {LOSS_PAUSE_SEC}s then resuming normal trading")
-                time.sleep(LOSS_PAUSE_SEC)
+                print(f"[SAFETY] Recovery declined — cooling down {_pause_sec}s then resuming normal trading")
+                time.sleep(_pause_sec)
             else:
                 # Recovery trade opened, wait shorter cooldown then continue
                 time.sleep(60)
-            # Skip loss check next cycle so bot can actually trade and break the streak
-            _skip_loss_check = True
+            _loss_pause_at_count = consec_losses  # Don't pause again for same streak
             continue
-        elif _skip_loss_check:
-            # One free cycle after loss pause — allow normal trading to potentially win
-            print(f"[SAFETY] ℹ️ Post-pause cycle: {consec_losses} losses still in DB, allowing 1 normal trade attempt")
-            _skip_loss_check = False
+        elif consec_losses >= LOSS_PAUSE_THRESHOLD:
+            # Already paused for this streak — trade normally to break it
+            print(f"[SAFETY] ℹ️ {consec_losses} losses (already paused) — trading normally to break streak")
 
         # FIX #12: Drawdown protection check
         dd_safe, dd_reason = check_max_drawdown()
@@ -3768,6 +3796,7 @@ def main_loop():
                         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
                         if trade_result and trade_result.get("success"):
                             _last_trade_ts = time.time()  # Update cooldown timer
+                            _loss_pause_at_count = 0  # Reset loss pause tracker — new trade can break streak
                             log_event("TRADE", f"{action} {symbol} Lot={lot_size} SL={sl_price} TP={tp_price}")
                             _trade_confidence = _extract_confidence(analysis) if analysis else None
                             _trade_regime = "consolidation" if consolidating else (trend_info.get("direction", "unknown") if trend_info else "unknown")
