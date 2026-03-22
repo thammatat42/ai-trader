@@ -591,7 +591,7 @@ if page == "🏠 Overview":
 
     # ── Safety Filters Status ──
     st.markdown("### 🛡️ Active Safety Filters")
-    bad_hours = os.getenv("BAD_HOURS_UTC", "2,3,4,5,6")
+    bad_hours = os.getenv("BAD_HOURS_UTC", "2,3")
     loss_threshold = os.getenv("LOSS_PAUSE_THRESHOLD", "3")
     loss_pause_sec = os.getenv("LOSS_PAUSE_SEC", "1800")
     min_hold = os.getenv("MIN_HOLD_SEC", "60")

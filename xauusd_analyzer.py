@@ -3348,10 +3348,10 @@ def main_loop():
             time.sleep(60)
             continue
 
-        # ---- Time-of-day filter ----
-        BAD_HOURS_UTC     = [int(h) for h in os.getenv("BAD_HOURS_UTC", "2,3,4,5,6").split(",") if h.strip()]
+        # ---- Time-of-day filter (skip for crypto — 24/7 market) ----
+        BAD_HOURS_UTC     = [int(h) for h in os.getenv("BAD_HOURS_UTC", "2,3").split(",") if h.strip()]
         current_hour_utc  = datetime.now(timezone.utc).hour
-        if current_hour_utc in BAD_HOURS_UTC:
+        if current_hour_utc in BAD_HOURS_UTC and not _is_crypto_symbol():
             # Calculate minutes until next good hour instead of sleeping fixed 60s
             now_utc = datetime.now(timezone.utc)
             minutes_left = 60 - now_utc.minute
