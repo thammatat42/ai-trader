@@ -1324,13 +1324,17 @@ def get_auto_generated_lessons() -> str:
 def check_daily_loss_limit() -> tuple[bool, str]:
     """
     Hard daily loss limit — stops ALL trading if daily losses exceed threshold.
-    Like Polymarket's circuit breaker: daily loss >= $X → stop for the day.
+    Like Polymarket's circuit breaker: daily loss >= X% of balance → stop for the day.
+    DAILY_LOSS_LIMIT is a percentage of balance (default 2%).
     """
-    daily_limit = float(os.getenv("DAILY_LOSS_LIMIT", 10.0))
-    if daily_limit <= 0:
+    daily_limit_pct = float(os.getenv("DAILY_LOSS_LIMIT_PCT", 2.0))
+    if daily_limit_pct <= 0:
         return True, "Daily loss limit disabled"
 
     try:
+        balance = _get_live_balance() or 100000
+        daily_limit = balance * daily_limit_pct / 100
+
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -1344,7 +1348,7 @@ def check_daily_loss_limit() -> tuple[bool, str]:
 
         today_pnl = float(row[0]) if row else 0
         if today_pnl <= -daily_limit:
-            msg = f"Daily loss limit hit: ${today_pnl:.2f} <= -${daily_limit:.2f}"
+            msg = f"Daily loss limit hit: ${today_pnl:.2f} <= -${daily_limit:.2f} ({daily_limit_pct}% of ${balance:.0f})"
             return False, msg
         return True, f"Daily P/L: ${today_pnl:+.2f} (limit: -${daily_limit:.2f})"
     except Exception as e:
@@ -3664,7 +3668,7 @@ def main_loop():
             print(f"[SAFETY] 🔴 {daily_msg} — pausing until tomorrow")
             log_event("DAILY_LOSS_LIMIT", daily_msg)
             # Sleep until midnight UTC
-            now_utc = datetime.utcnow()
+            now_utc = datetime.now(timezone.utc)
             midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
             sleep_sec = (midnight - now_utc).total_seconds()
             print(f"[SAFETY] Sleeping {int(sleep_sec/3600)}h until next day")
