@@ -2203,6 +2203,9 @@ POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", 5))
 MIN_HOLD_SEC            = int(os.getenv("MIN_HOLD_SEC",   120))
 MAX_HOLD_SEC            = int(os.getenv("MAX_HOLD_SEC",   1800))
 MAX_HOLD_SEC_LOSS       = int(os.getenv("MAX_HOLD_SEC_LOSS", 600))  # Shorter hold for losing positions
+# Crypto gets longer hold — higher volatility, wider oscillation
+if _is_crypto_symbol():
+    MAX_HOLD_SEC_LOSS = max(MAX_HOLD_SEC_LOSS, 900)  # At least 15 min for crypto
 TRAILING_STEP_PRICE     = float(os.getenv("TRAILING_STEP_PRICE",   1.0))
 TRAILING_PROTECT_PCT    = float(os.getenv("TRAILING_PROTECT_PCT",  50))
 PROFIT_LOCK_PCT         = float(os.getenv("PROFIT_LOCK_PCT",        5.0))
@@ -2462,13 +2465,23 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
     extra_ctx = "\n".join(extra_lines)
 
     _sym = os.getenv("SYMBOL", "XAUUSDm")
+    # Calculate loss as % of SL for context
+    _sl_context = ""
+    if open_price and open_price > 0:
+        _sl_distance = abs(current_price - open_price)
+        _atr_ref = calc_atr(candles_scalp, 14) if candles_scalp and len(candles_scalp) >= 14 else None
+        if _atr_ref and _atr_ref > 0:
+            _sl_pct = _sl_distance / _atr_ref * 100
+            _sl_context = f"Loss is {_sl_pct:.0f}% of ATR — {'within normal range, SL not threatened' if _sl_pct < 120 else 'approaching SL zone'}"
     compact_prompt = (
         f"{_sym} {scalp_tf} candles: {candle_str}\n"
         f"{' | '.join(indicators)}\n"
         f"Position: {position_type} | Profit=${profit:+.2f} | Hold={hold_sec}s\n"
+        + (f"{_sl_context}\n" if _sl_context else "")
         + (f"{extra_ctx}\n" if extra_ctx else "")
         + f"Question: Should this {position_type} position be held or closed NOW?\n"
-        f"Consider: momentum, indicators, S/R, risk of reversal"
+        f"IMPORTANT: In a strong trend, temporary drawdown is NORMAL. Only CLOSE if trend is REVERSING.\n"
+        f"Consider: momentum direction, trend continuation vs reversal, S/R, risk"
         + (", news impact" if news_alert else "") + ".\n"
         f"Reply format: HOLD or CLOSE — then max 10 words reason."
     )
@@ -2880,15 +2893,26 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     continue
 
             # Check losing positions approaching max hold (70-100% of MAX_HOLD_SEC_LOSS)
+            # Only ask AI if loss is significant relative to SL distance
+            # This prevents premature exits on positions where SL gives plenty of room
             if profit <= 0 and hold_sec > MAX_HOLD_SEC_LOSS * 0.7:
-                forecast = ai_quick_forecast(
-                    candles_scalp, current_price, pos_type, profit, scalp_tf,
-                    open_price=open_price, hold_sec=hold_sec,
-                    news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
-                )
-                print(f"[SMART] ⚠️ #{ticket} losing ${profit:.2f} at {hold_sec}s | AI: {forecast['action']} — {forecast['reason']}")
-                if forecast["action"] == "CLOSE":
-                    close_position_mt5(ticket)
+                # Calculate how much of the SL room has been used
+                _price_against = abs(current_price - open_price)
+                _sl_room_total = abs(current_sl - open_price) if current_sl > 0 else 999
+                _sl_used_pct = (_price_against / _sl_room_total * 100) if _sl_room_total > 0 else 0
+
+                if _sl_used_pct < 30 and hold_sec < MAX_HOLD_SEC_LOSS * 0.9:
+                    # Loss is small relative to SL — price is oscillating normally, skip AI check
+                    pass
+                else:
+                    forecast = ai_quick_forecast(
+                        candles_scalp, current_price, pos_type, profit, scalp_tf,
+                        open_price=open_price, hold_sec=hold_sec,
+                        news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
+                    )
+                    print(f"[SMART] ⚠️ #{ticket} losing ${profit:.2f} at {hold_sec}s (SL {_sl_used_pct:.0f}% used) | AI: {forecast['action']} — {forecast['reason']}")
+                    if forecast["action"] == "CLOSE":
+                        close_position_mt5(ticket)
 
         # Cleanup stale entries
         open_tickets = {p["ticket"] for p in positions}
