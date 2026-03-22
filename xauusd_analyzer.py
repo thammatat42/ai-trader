@@ -198,6 +198,12 @@ def calculate_lot_size(atr_value: float | None = None) -> dict:
     max_lot = float(os.getenv("MAX_LOT", 1.0))
     final_lot = max(0.01, min(max_lot, round(lot_size, 2)))
 
+    # Warn if min lot clamp causes actual risk to exceed intended risk
+    if lot_size < 0.01:
+        actual_risk = 0.01 * sl_points * point_value_per_lot
+        actual_pct = actual_risk / balance * 100 if balance > 0 else 0
+        print(f"[RISK] ⚠️ Min lot 0.01 → actual risk ${actual_risk:.2f} ({actual_pct:.1f}% of balance, intended {risk_pct}%)")
+
     # Warn if MAX_LOT is capping the calculated lot significantly
     if lot_size > max_lot * 1.5:
         print(f"[RISK] ⚠️ MAX_LOT={max_lot} is capping calculated lot {lot_size:.2f} — "
