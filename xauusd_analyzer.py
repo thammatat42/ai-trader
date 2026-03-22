@@ -2251,6 +2251,7 @@ _forecast_failures: dict = {}  # ticket -> [fail_count, last_fail_ts]
 _recovery_attempts_recent: list = []  # [(timestamp, action)]
 # Recovery profit target: accumulated loss amount that the next trade should recover
 _recovery_target: float = 0.0  # set when trade opens after consecutive losses
+_recovery_target_lock = threading.Lock()  # Thread-safe access between main loop and monitor
 
 
 def _get_account_balance() -> float:
@@ -2538,13 +2539,18 @@ def smart_position_monitor(scalp_tf: str = "M15"):
         resp.raise_for_status()
         positions = resp.json().get("positions", [])
         if not positions:
-            if _recovery_target > 0:
-                _recovery_target = 0.0  # Clear recovery target when no positions open
+            with _recovery_target_lock:
+                if _recovery_target > 0:
+                    _recovery_target = 0.0  # Clear recovery target when no positions open
             return
 
         now_ts  = int(datetime.now(timezone.utc).timestamp())
         balance = _get_account_balance()
         atr     = _get_cached_atr(scalp_tf)
+
+        # Take a thread-safe local snapshot of recovery target for this cycle
+        with _recovery_target_lock:
+            _recovery_target_local = _recovery_target
 
         profit_lock_usd    = balance * (PROFIT_LOCK_PCT      / 100) if PROFIT_LOCK_PCT > 0 else 0
         breakeven_usd      = balance * (BREAKEVEN_TRIGGER_PCT / 100)
@@ -2617,43 +2623,43 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
             # ===== RECOVERY TARGET MANAGEMENT =====
             # When trading after consecutive losses, tighten SL once profit covers accumulated loss
-            if _recovery_target > 0 and profit > 0:
+            if _recovery_target_local > 0 and profit > 0:
                 price_delta = abs(current_price - open_price)
                 if price_delta > 0:
                     profit_per_usd = profit / price_delta  # $ profit per $1 price move
                 else:
                     profit_per_usd = 0
 
-                if profit >= _recovery_target:
+                if profit >= _recovery_target_local:
                     # Profit covers accumulated loss — tighten SL to lock in 70% of recovery
-                    lock_profit = _recovery_target * 0.70
+                    lock_profit = _recovery_target_local * 0.70
                     if profit_per_usd > 0:
                         lock_distance = lock_profit / profit_per_usd  # USD distance from entry
                         if pos_type == "BUY":
                             recovery_sl = round(open_price + lock_distance, 2)
                             if current_sl < recovery_sl:
-                                print(f"[RECOVERY-TARGET] 🎯 #{ticket} profit ${profit:.2f} >= target ${_recovery_target:.2f} "
+                                print(f"[RECOVERY-TARGET] 🎯 #{ticket} profit ${profit:.2f} >= target ${_recovery_target_local:.2f} "
                                       f"→ locking SL to {recovery_sl} (protects ${lock_profit:.2f} / 70% of loss recovery)")
                                 modify_sl_mt5(ticket, recovery_sl)
                                 log_event("RECOVERY_LOCK", f"#{ticket} SL→{recovery_sl} locking ${lock_profit:.2f} recovery")
                         elif pos_type == "SELL":
                             recovery_sl = round(open_price - lock_distance, 2)
                             if current_sl > recovery_sl or current_sl <= 0:
-                                print(f"[RECOVERY-TARGET] 🎯 #{ticket} profit ${profit:.2f} >= target ${_recovery_target:.2f} "
+                                print(f"[RECOVERY-TARGET] 🎯 #{ticket} profit ${profit:.2f} >= target ${_recovery_target_local:.2f} "
                                       f"→ locking SL to {recovery_sl} (protects ${lock_profit:.2f} / 70% of loss recovery)")
                                 modify_sl_mt5(ticket, recovery_sl)
                                 log_event("RECOVERY_LOCK", f"#{ticket} SL→{recovery_sl} locking ${lock_profit:.2f} recovery")
 
-                elif profit >= _recovery_target * 0.5:
+                elif profit >= _recovery_target_local * 0.5:
                     # Halfway to recovery — at minimum move SL to breakeven + small buffer
                     _be_buf = round(atr * 0.10, 2) if atr else 0.10
                     if pos_type == "BUY" and current_sl < open_price:
                         be_sl = round(open_price + _be_buf, 2)
-                        print(f"[RECOVERY-HALF] 📊 #{ticket} profit ${profit:.2f} is 50%+ of target ${_recovery_target:.2f} → ensuring BE at {be_sl}")
+                        print(f"[RECOVERY-HALF] 📊 #{ticket} profit ${profit:.2f} is 50%+ of target ${_recovery_target_local:.2f} → ensuring BE at {be_sl}")
                         modify_sl_mt5(ticket, be_sl)
                     elif pos_type == "SELL" and current_sl > open_price:
                         be_sl = round(open_price - _be_buf, 2)
-                        print(f"[RECOVERY-HALF] 📊 #{ticket} profit ${profit:.2f} is 50%+ of target ${_recovery_target:.2f} → ensuring BE at {be_sl}")
+                        print(f"[RECOVERY-HALF] 📊 #{ticket} profit ${profit:.2f} is 50%+ of target ${_recovery_target_local:.2f} → ensuring BE at {be_sl}")
                         modify_sl_mt5(ticket, be_sl)
 
             # Track max profit high watermark per position
@@ -2741,9 +2747,9 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                                     # Profitable but trend turning — take profit
                                     # Recovery check: if profit covers recovery target, definitely close
                                     _should_close = False
-                                    if _recovery_target > 0 and profit >= _recovery_target * 0.7:
+                                    if _recovery_target_local > 0 and profit >= _recovery_target_local * 0.7:
                                         print(f"[TREND-EXIT] 🎯 #{ticket} {pos_type} trend reversed to {h1_trend}, "
-                                              f"profit ${profit:.2f} covers {profit/_recovery_target*100:.0f}% of recovery target ${_recovery_target:.2f} → CLOSE (lock recovery)")
+                                              f"profit ${profit:.2f} covers {profit/_recovery_target_local*100:.0f}% of recovery target ${_recovery_target_local:.2f} → CLOSE (lock recovery)")
                                         _should_close = True
                                     elif profit >= max_profit_seen * 0.5 and max_profit_seen > 0:
                                         # Profit already dropped from peak — take what's left
@@ -2820,10 +2826,11 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
             # Build recovery context for AI forecast
             _fc_recovery = ""
-            if _recovery_target > 0:
-                _fc_recovery = (f"Recovery target: ${_recovery_target:.2f} (accumulated losses). "
-                                f"Current profit covers {profit/_recovery_target*100:.0f}%. "
-                                f"{'HOLD to reach target' if profit < _recovery_target else 'Target MET — consider taking profit'}")
+            if _recovery_target_local > 0:
+                coverage = profit / _recovery_target_local * 100
+                _fc_recovery = (f"Recovery target: ${_recovery_target_local:.2f} (accumulated losses). "
+                                f"Current profit covers {coverage:.0f}%. "
+                                f"{'HOLD to reach target' if profit < _recovery_target_local else 'Target MET — consider taking profit'}")
 
             if hold_sec >= MAX_HOLD_SEC_LOSS and profit <= 0:
                 forecast = ai_quick_forecast(
@@ -3458,7 +3465,8 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
             global _last_trade_ts, _recovery_target
             _last_trade_ts = time.time()  # Update cooldown timer
             _loss_pause_at_count = consec_losses if consec_losses > 0 else 999  # Mark current losses as handled
-            _recovery_target = total_loss  # Set recovery target for position monitor
+            with _recovery_target_lock:
+                _recovery_target = total_loss  # Set recovery target for position monitor
             _recovery_attempts_recent.append((time.time(), action))
             print(f"[RECOVERY] ✅ Recovery {action} | lot={lot_size} ({lot_scale:.0%}) conf={confidence} "
                   f"SL={sl_price} TP={tp_price} | recovering ${total_loss:.2f} → target ${recovery_potential:.2f}")
@@ -3732,13 +3740,15 @@ def main_loop():
                 # Set recovery target: accumulated loss from current losing streak
                 loss_info = get_consecutive_loss_total(symbol)
                 if loss_info["total_loss"] > 0:
-                    _recovery_target = loss_info["total_loss"]
-                    print(f"[RECOVERY-TARGET] 🎯 Setting recovery target: ${_recovery_target:.2f} "
+                    with _recovery_target_lock:
+                        _recovery_target = loss_info["total_loss"]
+                    print(f"[RECOVERY-TARGET] 🎯 Setting recovery target: ${loss_info['total_loss']:.2f} "
                           f"(from {loss_info['count']} consecutive losses)")
             elif consec_losses_now == 0:
-                if _recovery_target > 0:
-                    print(f"[RECOVERY-TARGET] ✅ Recovery target cleared (no consecutive losses)")
-                _recovery_target = 0.0  # Clear target when no losses
+                with _recovery_target_lock:
+                    if _recovery_target > 0:
+                        print(f"[RECOVERY-TARGET] ✅ Recovery target cleared (no consecutive losses)")
+                    _recovery_target = 0.0  # Clear target when no losses
 
             # Consolidation risk reduction: halve lot when market is sideways
             if consolidating:
