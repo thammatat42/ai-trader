@@ -2866,7 +2866,7 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     open_price=open_price, hold_sec=hold_sec,
                     news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
                 )
-                print(f"[SMART] ⚠️ #{ticket} losing ${profit:.2f} at {hold_sec}s | AI: {forecast['action']}")
+                print(f"[SMART] ⚠️ #{ticket} losing ${profit:.2f} at {hold_sec}s | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
                     close_position_mt5(ticket)
 

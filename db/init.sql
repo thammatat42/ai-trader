@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS api_usage_log (
     completion_tokens   INTEGER       DEFAULT 0,
     total_tokens        INTEGER       DEFAULT 0,
     response_time_ms    INTEGER       DEFAULT 0,        -- latency in ms
-    status              VARCHAR(10)   DEFAULT 'OK',     -- OK / ERROR
+    status              VARCHAR(20)   DEFAULT 'OK',     -- OK / ERROR / OK_FORECAST
     created_at          TIMESTAMP     DEFAULT NOW()
 );
 
