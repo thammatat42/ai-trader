@@ -2458,6 +2458,7 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
         extra_lines.append(f"Recent: {win_rate_summary}")
     extra_ctx = "\n".join(extra_lines)
 
+    _sym = os.getenv("SYMBOL", "XAUUSDm")
     compact_prompt = (
         f"{_sym} {scalp_tf} candles: {candle_str}\n"
         f"{' | '.join(indicators)}\n"
