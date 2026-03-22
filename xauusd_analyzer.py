@@ -3792,11 +3792,73 @@ def main_loop():
                     f"Counter-trend trades need confidence 8+."
                 )
 
+            # Build dynamic bias analysis for AI context
+            bias_context = ""
+            try:
+                conn_bc = get_db_connection()
+                cur_bc = conn_bc.cursor()
+                cur_bc.execute(
+                    """SELECT action, COUNT(*), COALESCE(SUM(profit), 0)
+                       FROM trades
+                       WHERE opened_at >= NOW() - INTERVAL '24 hours'
+                         AND status = 'CLOSED'
+                       GROUP BY action;"""
+                )
+                bc_rows = cur_bc.fetchall()
+                cur_bc.close()
+                conn_bc.close()
+                if bc_rows:
+                    bc_data = {r[0]: {"count": r[1], "pnl": float(r[2])} for r in bc_rows}
+                    bc_total = sum(d["count"] for d in bc_data.values())
+                    if bc_total >= 3:
+                        bc_parts = [f"{a}: {d['count']} trades (P/L=${d['pnl']:+.2f})" for a, d in bc_data.items()]
+                        dominant = max(bc_data, key=lambda a: bc_data[a]["count"])
+                        dom_pct = bc_data[dominant]["count"] / bc_total * 100
+                        dom_pnl = bc_data[dominant]["pnl"]
+                        trend_note = ""
+                        if trend_info:
+                            t_dir = trend_info.get("direction", "MIXED")
+                            t_str = trend_info.get("strength", 0)
+                            if t_dir == dominant and t_str >= 2:
+                                trend_note = (
+                                    f"The {dominant} bias ALIGNS with the H1+H4 trend (strength {t_str}/3). "
+                                    f"Trend-following is valid — repeated same-direction trades are OK when the trend confirms. "
+                                    f"Focus on ENTRY QUALITY (pullbacks, confluence) rather than switching direction."
+                                )
+                            elif t_dir != "MIXED" and t_dir != dominant:
+                                trend_note = (
+                                    f"WARNING: The {dominant} bias is AGAINST the H1+H4 trend ({t_dir}, strength {t_str}/3). "
+                                    f"This is dangerous — the market has shifted. Strongly consider {t_dir} setups instead."
+                                )
+                            else:
+                                trend_note = (
+                                    f"Trend is MIXED — no clear multi-TF alignment. "
+                                    f"High {dominant} bias without trend support suggests caution. Require strong confluence."
+                                )
+                        pnl_note = ""
+                        if dom_pnl > 0:
+                            pnl_note = f"The {dominant} trades are NET PROFITABLE (${dom_pnl:+.2f}) — the direction has been working."
+                        else:
+                            pnl_note = f"The {dominant} trades are NET LOSING (${dom_pnl:+.2f}) — this direction is NOT working. Consider switching."
+                        bias_context = (
+                            f"\n=== DIRECTION BIAS ANALYSIS (24h) ===\n"
+                            f"Trades today: {' | '.join(bc_parts)} (total={bc_total})\n"
+                            f"Dominant direction: {dominant} at {dom_pct:.0f}%\n"
+                            f"{pnl_note}\n"
+                            f"{trend_note}\n"
+                            f"RULE: If bias aligns with trend AND is profitable → same direction is OK with good entry. "
+                            f"If bias is against trend OR losing → actively seek the opposite direction or WAIT.\n"
+                        )
+            except Exception:
+                pass
+
             extra_knowledge = ""
             if perf_context:
                 extra_knowledge += perf_context
             if trend_context:
                 extra_knowledge += trend_context
+            if bias_context:
+                extra_knowledge += bias_context
             if consolidating:
                 if _is_crypto_symbol():
                     extra_knowledge += (
@@ -3908,34 +3970,45 @@ def main_loop():
                                 log_event("SR_FILTER", f"SELL blocked: room={room_to_support:.2f} < TP*{_sr_room_pct}={tp_distance_usd*_sr_room_pct:.2f}")
                                 action = "WAIT"
 
-            # ---- Direction Bias filter ----
-            # If recent trades are heavily biased in one direction, block more of the same
+            # ---- Direction Bias SAFETY NET ----
+            # The AI now receives full bias + trend + P/L context in its prompt,
+            # so it can make informed decisions about direction bias dynamically.
+            # This hard-coded filter is now an EXTREME safety net only:
+            # Block when >90% same direction AND that direction is net-losing (clearly broken)
             if action in ("BUY", "SELL") and win_stats["total"] >= 5:
                 try:
                     conn_bias = get_db_connection()
                     cur_bias = conn_bias.cursor()
                     cur_bias.execute(
-                        """SELECT action, COUNT(*) FROM trades
+                        """SELECT action, COUNT(*), COALESCE(SUM(profit), 0) FROM trades
                            WHERE opened_at >= NOW() - INTERVAL '24 hours'
+                             AND status = 'CLOSED'
                            GROUP BY action;"""
                     )
                     bias_rows = cur_bias.fetchall()
                     cur_bias.close()
                     conn_bias.close()
-                    direction_counts = {r[0]: r[1] for r in bias_rows}
-                    total_dir = sum(direction_counts.values())
+                    direction_counts = {r[0]: {"count": r[1], "pnl": float(r[2])} for r in bias_rows}
+                    total_dir = sum(d["count"] for d in direction_counts.values())
                     if total_dir >= 5:
-                        same_dir_count = direction_counts.get(action, 0)
-                        same_dir_pct = same_dir_count / total_dir * 100
-                        if same_dir_pct > 75:
-                            confidence = _extract_confidence(analysis)
-                            if confidence < 8:
-                                print(
-                                    f"[BIAS] ⚠️ {action} blocked: {same_dir_pct:.0f}% of last {total_dir} "
-                                    f"trades are {action}, conf={confidence} < 8 → WAIT"
-                                )
-                                log_event("BIAS_FILTER", f"{action} bias {same_dir_pct:.0f}%, conf={confidence}")
-                                action = "WAIT"
+                        action_data = direction_counts.get(action, {"count": 0, "pnl": 0})
+                        same_dir_pct = action_data["count"] / total_dir * 100
+                        same_dir_pnl = action_data["pnl"]
+                        confidence = _extract_confidence(analysis)
+                        # Extreme safety: >90% same direction AND losing money → hard block
+                        if same_dir_pct >= 90 and same_dir_pnl < 0 and confidence < 8:
+                            print(
+                                f"[BIAS] 🛑 {action} blocked (safety net): {same_dir_pct:.0f}% of {total_dir} "
+                                f"trades are {action} AND net P/L=${same_dir_pnl:+.2f} (losing), conf={confidence} < 8 → WAIT"
+                            )
+                            log_event("BIAS_FILTER", f"{action} extreme bias {same_dir_pct:.0f}%, net_pnl={same_dir_pnl:+.2f}, conf={confidence}")
+                            action = "WAIT"
+                        elif same_dir_pct > 75:
+                            # Soft warning — AI already has this context, just log it
+                            print(
+                                f"[BIAS] ℹ️ {action} bias {same_dir_pct:.0f}% (net ${same_dir_pnl:+.2f}) — "
+                                f"AI has full context, trusting its conf={confidence} decision"
+                            )
                 except Exception:
                     pass  # bias check is best-effort
 
