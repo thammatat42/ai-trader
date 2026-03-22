@@ -2863,6 +2863,19 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 )
                 print(f"[SMART] 💰 #{ticket} {pos_type} | {hold_sec}s | ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
+                    # Re-check profit before closing — price can move during AI call (787ms+)
+                    # With large lots, even $0.30 move = big P/L swing
+                    try:
+                        _re = http_session.get(f"http://{windows_ip}:8000/positions", timeout=5)
+                        _re_pos = [p for p in _re.json().get("positions", []) if p["ticket"] == ticket]
+                        if _re_pos:
+                            _re_profit = _re_pos[0]["profit"]
+                            if _re_profit <= 0 and profit > 0:
+                                print(f"[SMART] ⏸️ #{ticket} profit flipped ${profit:.2f} → ${_re_profit:.2f} during AI call — HOLD instead of closing at loss")
+                                continue
+                            profit = _re_profit  # Use latest profit for log accuracy
+                    except Exception:
+                        pass  # If re-check fails, proceed with close (original decision still valid)
                     close_position_mt5(ticket)
                     continue
 
@@ -3519,6 +3532,7 @@ def main_loop():
     pause_retries      = 0
     _last_market_log   = None
     _loss_pause_at_count = 999   # loss count already paused for (999 = skip on startup, reset when trade opens)
+    _loss_pause_logged = False   # track whether "already paused" message was logged (avoid spam)
     _recovery_target = 0.0  # reset on startup
 
     while not _shutdown:
@@ -3596,10 +3610,13 @@ def main_loop():
                 # Recovery trade opened, wait shorter cooldown then continue
                 time.sleep(60)
             _loss_pause_at_count = consec_losses  # Don't pause again for same streak
+            _loss_pause_logged = False  # Reset so we log the "already paused" message once
             continue
         elif consec_losses >= LOSS_PAUSE_THRESHOLD:
-            # Already paused for this streak — trade normally to break it
-            print(f"[SAFETY] ℹ️ {consec_losses} losses (already paused) — trading normally to break streak")
+            # Already paused for this streak — log once, then stay quiet
+            if not _loss_pause_logged:
+                print(f"[SAFETY] ℹ️ {consec_losses} losses (already paused) — trading normally to break streak")
+                _loss_pause_logged = True
 
         # FIX #12: Drawdown protection check
         dd_safe, dd_reason = check_max_drawdown()
