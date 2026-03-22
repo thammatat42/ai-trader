@@ -2711,12 +2711,12 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                             modify_sl_mt5(ticket, ideal_sl)
 
             # ===== TREND REVERSAL EXIT =====
-            # If position is held long enough and H1 trend has reversed, close losing positions early
-            # Crypto: require 5min hold (H1 EMA noise) and meaningful loss (> spread cost)
-            # Gold: 2min hold, any loss
+            # Close positions when H1 trend reverses:
+            # - Losing positions: close early to cut losses
+            # - Profitable positions: take profit before trend eats gains
             _trend_exit_hold = 300 if _is_crypto_symbol() else 120
             _trend_exit_min_loss = -1.0 if _is_crypto_symbol() else 0
-            if hold_sec >= _trend_exit_hold and profit <= _trend_exit_min_loss:
+            if hold_sec >= _trend_exit_hold:
                 try:
                     candles_h1_check = get_candles_from_mt5("H1", 30)
                     if candles_h1_check and len(candles_h1_check) >= 21:
@@ -2726,10 +2726,31 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                         if ema9_h1 and ema21_h1:
                             h1_trend = "BUY" if ema9_h1 > ema21_h1 else "SELL"
                             if pos_type != h1_trend:
-                                print(f"[TREND-EXIT] ⚠️ #{ticket} {pos_type} but H1 trend={h1_trend} (EMA9={ema9_h1:.2f} EMA21={ema21_h1:.2f}) profit=${profit:.2f} → CLOSE")
-                                close_position_mt5(ticket)
-                                log_event("TREND_REVERSAL_EXIT", f"#{ticket} {pos_type} closed — H1 trend reversed to {h1_trend}")
-                                continue
+                                # Trend reversed against our position
+                                if profit <= _trend_exit_min_loss:
+                                    # Losing — exit immediately
+                                    print(f"[TREND-EXIT] ⚠️ #{ticket} {pos_type} but H1 trend={h1_trend} "
+                                          f"(EMA9={ema9_h1:.2f} EMA21={ema21_h1:.2f}) profit=${profit:.2f} → CLOSE (cut loss)")
+                                    close_position_mt5(ticket)
+                                    log_event("TREND_REVERSAL_EXIT", f"#{ticket} {pos_type} closed — H1 reversed to {h1_trend}, loss=${profit:.2f}")
+                                    continue
+                                elif profit > 0:
+                                    # Profitable but trend turning — take profit
+                                    # Recovery check: if profit covers recovery target, definitely close
+                                    _should_close = False
+                                    if _recovery_target > 0 and profit >= _recovery_target * 0.7:
+                                        print(f"[TREND-EXIT] 🎯 #{ticket} {pos_type} trend reversed to {h1_trend}, "
+                                              f"profit ${profit:.2f} covers {profit/_recovery_target*100:.0f}% of recovery target ${_recovery_target:.2f} → CLOSE (lock recovery)")
+                                        _should_close = True
+                                    elif profit >= max_profit_seen * 0.5 and max_profit_seen > 0:
+                                        # Profit already dropped from peak — take what's left
+                                        print(f"[TREND-EXIT] 💰 #{ticket} {pos_type} trend reversed to {h1_trend}, "
+                                              f"profit ${profit:.2f} (peak ${max_profit_seen:.2f}) → CLOSE (protect gains)")
+                                        _should_close = True
+                                    if _should_close:
+                                        close_position_mt5(ticket)
+                                        log_event("TREND_REVERSAL_EXIT", f"#{ticket} {pos_type} closed — H1 reversed to {h1_trend}, profit=${profit:.2f}")
+                                        continue
                 except Exception:
                     pass  # trend reversal check is best-effort
 
@@ -2794,6 +2815,13 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 smart_position_monitor._fc_ts = now_ts
             _fc_news, _fc_trend, _fc_wr = smart_position_monitor._fc_ctx
 
+            # Build recovery context for AI forecast
+            _fc_recovery = ""
+            if _recovery_target > 0:
+                _fc_recovery = (f"Recovery target: ${_recovery_target:.2f} (accumulated losses). "
+                                f"Current profit covers {profit/_recovery_target*100:.0f}%. "
+                                f"{'HOLD to reach target' if profit < _recovery_target else 'Target MET — consider taking profit'}")
+
             if hold_sec >= MAX_HOLD_SEC_LOSS and profit <= 0:
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
@@ -2805,15 +2833,28 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     close_position_mt5(ticket)
                 continue
 
-            if profit >= min_profit_close and hold_sec >= MIN_HOLD_SEC:
+            # AI profit-taking: two paths
+            # 1. Percentage-based (original): profit >= 0.5% of balance
+            # 2. Absolute-dollar (new): profit >= $0.50 after MIN_HOLD_SEC — for small lots
+            #    This ensures AI manages positions even when lot size is tiny
+            _abs_profit_threshold = 0.50 if _is_crypto_symbol() else 2.0
+            _should_check_profit = (
+                (profit >= min_profit_close and hold_sec >= MIN_HOLD_SEC) or  # %-based
+                (profit >= _abs_profit_threshold and hold_sec >= MIN_HOLD_SEC)  # absolute
+            )
+
+            if _should_check_profit:
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
-                    news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
+                    news_alert=_fc_news,
+                    trend_summary=_fc_trend + (f" | {_fc_recovery}" if _fc_recovery else ""),
+                    win_rate_summary=_fc_wr,
                 )
                 print(f"[SMART] 💰 #{ticket} {pos_type} | {hold_sec}s | ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
                     close_position_mt5(ticket)
+                    continue
 
             # Check losing positions approaching max hold (70-100% of MAX_HOLD_SEC_LOSS)
             if profit <= 0 and hold_sec > MAX_HOLD_SEC_LOSS * 0.7:
