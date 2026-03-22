@@ -198,10 +198,15 @@ def calculate_lot_size(atr_value: float | None = None) -> dict:
     max_lot = float(os.getenv("MAX_LOT", 1.0))
     final_lot = max(0.01, min(max_lot, round(lot_size, 2)))
 
+    # Warn if MAX_LOT is capping the calculated lot significantly
+    if lot_size > max_lot * 1.5:
+        print(f"[RISK] ⚠️ MAX_LOT={max_lot} is capping calculated lot {lot_size:.2f} — "
+              f"consider increasing MAX_LOT in .env to use full risk budget")
+
     print(
         f"[RISK] Balance ${balance:,.2f} ({balance_src}) | Risk {risk_pct}% (${risk_amount:,.2f}) "
         f"| SL {sl_points} ({sl_src}) | TP {tp_points} | R:R 1:{tp_points/sl_points:.1f} "
-        f"-> Lot: {final_lot}"
+        f"-> Lot: {final_lot} (calc={lot_size:.2f}, max={max_lot})"
     )
     return {"lot_size": final_lot, "sl_points": sl_points, "tp_points": tp_points}
 
@@ -1634,6 +1639,44 @@ def get_consecutive_losses() -> int:
         return 0
 
 
+def get_consecutive_loss_total(symbol: str) -> dict:
+    """Get details of the current consecutive losing streak.
+    Returns {count, total_loss, losses: [{action, profit, sl, tp, open, close}]}
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT action, open_price, close_price, profit, sl_price, tp_price, lot
+            FROM trades
+            WHERE symbol = %s AND status = 'CLOSED' AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT 10;
+            """,
+            (symbol,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        losses = []
+        total_loss = 0.0
+        for row in rows:
+            profit = float(row[3] or 0)
+            if profit <= 0:
+                losses.append({
+                    "action": row[0], "open": row[1], "close": row[2],
+                    "profit": profit, "sl": row[4], "tp": row[5], "lot": float(row[6] or 0),
+                })
+                total_loss += abs(profit)
+            else:
+                break
+        return {"count": len(losses), "total_loss": round(total_loss, 2), "losses": losses}
+    except Exception:
+        return {"count": 0, "total_loss": 0.0, "losses": []}
+
+
 # FIX #12: Add max drawdown protection — stop trading if account drops > X% from peak
 def check_max_drawdown() -> tuple[bool, str]:
     """
@@ -2204,6 +2247,8 @@ _position_max_profit: dict = {}  # ticket -> max_profit_seen
 _forecast_failures: dict = {}  # ticket -> [fail_count, last_fail_ts]
 # Recovery whipsaw protection
 _recovery_attempts_recent: list = []  # [(timestamp, action)]
+# Recovery profit target: accumulated loss amount that the next trade should recover
+_recovery_target: float = 0.0  # set when trade opens after consecutive losses
 
 
 def _get_account_balance() -> float:
@@ -2478,7 +2523,9 @@ def smart_position_monitor(scalp_tf: str = "M15"):
     - Partial close at first profit target (lock 50% of gains)
     - Rapid price spike detection (immediate reaction to adverse moves)
     - Richer AI forecast with S/R + multi-indicator context
+    - Recovery-aware trailing: tightens SL when profit covers accumulated losses
     """
+    global _recovery_target
     windows_ip = os.getenv("WINDOWS_IP")
     if not windows_ip:
         return
@@ -2488,6 +2535,8 @@ def smart_position_monitor(scalp_tf: str = "M15"):
         resp.raise_for_status()
         positions = resp.json().get("positions", [])
         if not positions:
+            if _recovery_target > 0:
+                _recovery_target = 0.0  # Clear recovery target when no positions open
             return
 
         now_ts  = int(datetime.now(timezone.utc).timestamp())
@@ -2562,6 +2611,47 @@ def smart_position_monitor(scalp_tf: str = "M15"):
             # Phase 1: small profit → tight trail (protect entry)
             # Phase 2: good profit → medium trail (survive normal swings)
             # Phase 3: after partial close → wide trail (let the runner go)
+
+            # ===== RECOVERY TARGET MANAGEMENT =====
+            # When trading after consecutive losses, tighten SL once profit covers accumulated loss
+            if _recovery_target > 0 and profit > 0:
+                price_delta = abs(current_price - open_price)
+                if price_delta > 0:
+                    profit_per_usd = profit / price_delta  # $ profit per $1 price move
+                else:
+                    profit_per_usd = 0
+
+                if profit >= _recovery_target:
+                    # Profit covers accumulated loss — tighten SL to lock in 70% of recovery
+                    lock_profit = _recovery_target * 0.70
+                    if profit_per_usd > 0:
+                        lock_distance = lock_profit / profit_per_usd  # USD distance from entry
+                        if pos_type == "BUY":
+                            recovery_sl = round(open_price + lock_distance, 2)
+                            if current_sl < recovery_sl:
+                                print(f"[RECOVERY-TARGET] 🎯 #{ticket} profit ${profit:.2f} >= target ${_recovery_target:.2f} "
+                                      f"→ locking SL to {recovery_sl} (protects ${lock_profit:.2f} / 70% of loss recovery)")
+                                modify_sl_mt5(ticket, recovery_sl)
+                                log_event("RECOVERY_LOCK", f"#{ticket} SL→{recovery_sl} locking ${lock_profit:.2f} recovery")
+                        elif pos_type == "SELL":
+                            recovery_sl = round(open_price - lock_distance, 2)
+                            if current_sl > recovery_sl or current_sl <= 0:
+                                print(f"[RECOVERY-TARGET] 🎯 #{ticket} profit ${profit:.2f} >= target ${_recovery_target:.2f} "
+                                      f"→ locking SL to {recovery_sl} (protects ${lock_profit:.2f} / 70% of loss recovery)")
+                                modify_sl_mt5(ticket, recovery_sl)
+                                log_event("RECOVERY_LOCK", f"#{ticket} SL→{recovery_sl} locking ${lock_profit:.2f} recovery")
+
+                elif profit >= _recovery_target * 0.5:
+                    # Halfway to recovery — at minimum move SL to breakeven + small buffer
+                    _be_buf = round(atr * 0.10, 2) if atr else 0.10
+                    if pos_type == "BUY" and current_sl < open_price:
+                        be_sl = round(open_price + _be_buf, 2)
+                        print(f"[RECOVERY-HALF] 📊 #{ticket} profit ${profit:.2f} is 50%+ of target ${_recovery_target:.2f} → ensuring BE at {be_sl}")
+                        modify_sl_mt5(ticket, be_sl)
+                    elif pos_type == "SELL" and current_sl > open_price:
+                        be_sl = round(open_price - _be_buf, 2)
+                        print(f"[RECOVERY-HALF] 📊 #{ticket} profit ${profit:.2f} is 50%+ of target ${_recovery_target:.2f} → ensuring BE at {be_sl}")
+                        modify_sl_mt5(ticket, be_sl)
 
             # Track max profit high watermark per position
             with _position_state_lock:
@@ -3162,30 +3252,31 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
             print(f"[RECOVERY] ⛔ Daily limit reached ({trades_today}/{max_trades}) — skipping")
             return False
 
-        # --- Get recent losses for AI context ---
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT action, open_price, close_price, profit, sl_price, tp_price
-            FROM trades
-            WHERE symbol = %s AND status = 'CLOSED' AND profit < 0
-            ORDER BY closed_at DESC LIMIT 3;
-        """, (symbol,))
-        recent_losses = cur.fetchall()
-        cur.close()
-        conn.close()
+        # --- Get recent losses with total accumulated loss ---
+        loss_info = get_consecutive_loss_total(symbol)
+        total_loss = loss_info["total_loss"]
+        loss_count = loss_info["count"]
 
-        loss_context = "RECENT LOSSES (recovery context):\n"
-        for row in recent_losses:
+        loss_context = f"CONSECUTIVE LOSS STREAK: {loss_count} trades, TOTAL LOSS = ${total_loss:.2f}\n"
+        loss_context += "Individual losses:\n"
+        for l in loss_info["losses"]:
             loss_context += (
-                f"  {row[0]} open={row[1]} close={row[2]} P/L=${row[3]:.2f} "
-                f"SL={row[4]} TP={row[5]}\n"
+                f"  {l['action']} open={l['open']} close={l['close']} P/L=${l['profit']:.2f} "
+                f"SL={l['sl']} TP={l['tp']} lot={l['lot']}\n"
             )
         loss_context += (
-            "RECOVERY RULE: Analyze if these losses indicate a trend reversal "
-            "or were caused by noise. If trend reversed, consider trading the NEW direction. "
-            "If losses were noise (e.g. stop hunts), the original direction may still be valid. "
-            "Only recommend a trade if you have HIGH confidence (7+).\n"
+            f"\nRECOVERY OBJECTIVE: The recovery trade must target a profit of at least "
+            f"${total_loss:.2f} to break even on this losing streak. "
+            f"Ideally target ${total_loss * 1.5:.2f}+ for a net positive recovery.\n"
+            f"\nRECOVERY RULES:\n"
+            f"1. Analyze WHY these {loss_count} trades lost — was it a trend reversal, stop hunt, or bad entry timing?\n"
+            f"2. If all losses were in the SAME direction, the trend may have reversed — consider the OPPOSITE direction.\n"
+            f"3. If losses were mixed directions, the market is choppy — require VERY strong signal (conf 8+).\n"
+            f"4. The TP target will be adjusted to recover ${total_loss:.2f}+ — assess if this price target is "
+            f"realistic given current volatility, support/resistance levels, and trend strength.\n"
+            f"5. If the recovery target seems unrealistic (too far from current price), recommend WAIT — "
+            f"do NOT force a trade just to recover. Patience is better than compounding losses.\n"
+            f"6. Only recommend a trade if you have HIGH confidence (7+) AND the TP target is achievable.\n"
         )
 
         # --- Fetch multi-TF candles for full analysis ---
@@ -3271,14 +3362,45 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
                 print(f"[RECOVERY] ⏸️ {action} against H1 trend {trend_dir}, conf={confidence} < 9 — skipping")
                 return False
 
-        # --- Dynamic lot sizing (use calculate_lot_size, then halve for safety) ---
+        # --- Smart recovery lot sizing & TP targeting ---
         atr_h1 = calc_atr(candles_h1, 14) if len(candles_h1) >= 14 else None
         risk_info = calculate_lot_size(atr_value=atr_h1)
         sl_points = risk_info["sl_points"]
         tp_points = risk_info["tp_points"]
+        pvpl = float(os.getenv("POINT_VALUE_PER_LOT", 1.0))
+        max_tp = float(os.getenv("MAX_TP_POINTS", 500))
 
-        # Recovery uses HALF the normal lot size (reduced risk after losses)
-        lot_size = max(0.01, round(risk_info["lot_size"] * 0.5, 2))
+        # Recovery lot: scale between 50%-100% of normal based on confidence
+        # conf 7 = 50% (cautious), conf 8 = 75%, conf 9-10 = 100% (high conviction)
+        lot_scale = min(1.0, 0.25 + (confidence - 6) * 0.25)  # 7->0.50, 8->0.75, 9->1.0
+        lot_size = max(0.01, round(risk_info["lot_size"] * lot_scale, 2))
+
+        # Calculate minimum TP needed to recover accumulated losses
+        if total_loss > 0 and lot_size > 0 and pvpl > 0:
+            # tp_dollars = tp_points * pvpl * lot_size
+            # => min_recovery_points = total_loss / (pvpl * lot_size)
+            min_recovery_points = total_loss / (pvpl * lot_size)
+            # Target 1.5x the loss for net positive recovery
+            target_recovery_points = round(min_recovery_points * 1.5)
+
+            if target_recovery_points > tp_points and target_recovery_points <= max_tp:
+                # Feasible — extend TP to cover accumulated losses
+                print(f"[RECOVERY] 📊 Extending TP: {tp_points} → {target_recovery_points} pts "
+                      f"to recover ${total_loss:.2f} loss (1.5x target)")
+                tp_points = target_recovery_points
+            elif target_recovery_points > max_tp:
+                # Recovery target exceeds MAX_TP — use MAX_TP and see what we can recover
+                potential_recovery = max_tp * pvpl * lot_size
+                print(f"[RECOVERY] 📊 Recovery target {target_recovery_points} pts > MAX_TP {max_tp} — "
+                      f"using MAX_TP, can recover ${potential_recovery:.2f} of ${total_loss:.2f}")
+                tp_points = int(max_tp)
+            else:
+                # Standard TP already covers the recovery
+                print(f"[RECOVERY] 📊 Standard TP {tp_points} pts already covers ${total_loss:.2f} recovery")
+
+        recovery_potential = round(tp_points * pvpl * lot_size, 2)
+        print(f"[RECOVERY] 💰 Loss=${total_loss:.2f} | TP target=${recovery_potential:.2f} "
+              f"| lot={lot_size} ({lot_scale:.0%} risk) | TP={tp_points} pts | SL={sl_points} pts")
 
         if action == "BUY":
             sl_price = round(ask - sl_points * POINT_SIZE, 2)
@@ -3289,12 +3411,15 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
 
         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
         if trade_result and trade_result.get("success"):
-            global _last_trade_ts
+            global _last_trade_ts, _recovery_target
             _last_trade_ts = time.time()  # Update cooldown timer
-            _loss_pause_at_count = 0  # Reset loss pause tracker — recovery trade can break streak
+            _loss_pause_at_count = consec_losses if consec_losses > 0 else 999  # Mark current losses as handled
+            _recovery_target = total_loss  # Set recovery target for position monitor
             _recovery_attempts_recent.append((time.time(), action))
-            print(f"[RECOVERY] ✅ Recovery {action} | lot={lot_size} (half-risk) conf={confidence} SL={sl_price} TP={tp_price}")
-            log_event("RECOVERY_TRADE", f"{action} lot={lot_size} conf={confidence} after losses")
+            print(f"[RECOVERY] ✅ Recovery {action} | lot={lot_size} ({lot_scale:.0%}) conf={confidence} "
+                  f"SL={sl_price} TP={tp_price} | recovering ${total_loss:.2f} → target ${recovery_potential:.2f}")
+            log_event("RECOVERY_TRADE", f"{action} lot={lot_size} conf={confidence} "
+                      f"loss=${total_loss:.2f} target=${recovery_potential:.2f}")
             save_trade_with_context(
                 order_id=trade_result["order_id"],
                 symbol=symbol,
@@ -3317,7 +3442,7 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
 
 
 def main_loop():
-    global _last_analysis_price, _consecutive_waits, _last_trade_ts
+    global _last_analysis_price, _consecutive_waits, _last_trade_ts, _recovery_target
     print("🚀 Starting AI Trader Background Service...")
     log_event("START", "AI Trader service started")
 
@@ -3342,6 +3467,7 @@ def main_loop():
     pause_retries      = 0
     _last_market_log   = None
     _loss_pause_at_count = 999   # loss count already paused for (999 = skip on startup, reset when trade opens)
+    _recovery_target = 0.0  # reset on startup
 
     while not _shutdown:
         # ---- Market hours check ----
@@ -3555,6 +3681,16 @@ def main_loop():
                 reduced_lot = max(0.01, round(lot_size * 0.5, 2))
                 print(f"[RISK] ⚠️ {consec_losses_now} consecutive losses → lot {lot_size} → {reduced_lot} (50% reduction)")
                 lot_size = reduced_lot
+                # Set recovery target: accumulated loss from current losing streak
+                loss_info = get_consecutive_loss_total(symbol)
+                if loss_info["total_loss"] > 0:
+                    _recovery_target = loss_info["total_loss"]
+                    print(f"[RECOVERY-TARGET] 🎯 Setting recovery target: ${_recovery_target:.2f} "
+                          f"(from {loss_info['count']} consecutive losses)")
+            elif consec_losses_now == 0:
+                if _recovery_target > 0:
+                    print(f"[RECOVERY-TARGET] ✅ Recovery target cleared (no consecutive losses)")
+                _recovery_target = 0.0  # Clear target when no losses
 
             # Consolidation risk reduction: halve lot when market is sideways
             if consolidating:
@@ -3796,7 +3932,7 @@ def main_loop():
                         trade_result = send_trade_to_mt5(action, symbol, lot_size, sl_points, tp_points, bid, ask)
                         if trade_result and trade_result.get("success"):
                             _last_trade_ts = time.time()  # Update cooldown timer
-                            _loss_pause_at_count = 0  # Reset loss pause tracker — new trade can break streak
+                            _loss_pause_at_count = consec_losses if consec_losses > 0 else 999  # Mark current losses as handled
                             log_event("TRADE", f"{action} {symbol} Lot={lot_size} SL={sl_price} TP={tp_price}")
                             _trade_confidence = _extract_confidence(analysis) if analysis else None
                             _trade_regime = "consolidation" if consolidating else (trend_info.get("direction", "unknown") if trend_info else "unknown")
