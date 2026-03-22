@@ -3786,7 +3786,7 @@ def main_loop():
             journal_detect_patterns()
 
             # Record price for price-event trigger
-            global _last_analysis_price, _consecutive_waits
+            global _last_analysis_price, _consecutive_waits, _last_trade_ts
             _last_analysis_price = (bid + ask) / 2
 
             # Track WAIT streaks (crypto escalation)
