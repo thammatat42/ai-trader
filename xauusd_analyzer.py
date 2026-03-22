@@ -3315,7 +3315,7 @@ def main_loop():
     consecutive_errors = 0
     pause_retries      = 0
     _last_market_log   = None
-    _skip_loss_check   = False  # skip loss check for 1 cycle after pause (prevent infinite loop)
+    _skip_loss_check   = True   # skip loss check on first cycle after startup/redeploy (don't penalize for old losses)
 
     while not _shutdown:
         # ---- Market hours check ----
