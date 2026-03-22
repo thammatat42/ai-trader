@@ -1484,9 +1484,11 @@ def parse_sentiment(ai_text: str) -> str:
     # Crypto uses a lower confidence threshold (consolidation-friendly)
     if _is_crypto_symbol():
         min_confidence = int(os.getenv("MIN_CONFIDENCE_CRYPTO", 6))
-        # WAIT-streak escalation: after many consecutive WAITs, relax by 1
-        if _consecutive_waits >= WAIT_STREAK_THRESHOLD and min_confidence > 5:
-            min_confidence -= 1
+
+    # WAIT-streak escalation: after many consecutive WAITs, relax by 1
+    # Applies to BOTH gold and crypto — prevents indefinite paralysis
+    if _consecutive_waits >= WAIT_STREAK_THRESHOLD and min_confidence > 5:
+        min_confidence -= 1
 
     if sentiment in ("BUY", "SELL") and confidence < min_confidence:
         print(f"[DECISION] ⚠️ AI says {sentiment} but confidence {confidence} < {min_confidence} → WAIT")
@@ -3915,60 +3917,69 @@ def main_loop():
             action = parse_sentiment(analysis)
             print(f"[DECISION] 🎯 AI Sentiment → {action}")
 
-            # ---- Trend alignment filter ----
-            # If AI says BUY/SELL but trend is opposite on H1+H4, require higher confidence
-            # Crypto: H1 alone is sufficient — only block counter-trend if strength >= 3 (all TFs against)
+            # ---- Trend alignment safety net ----
+            # AI already receives full trend context in its prompt. This is an EXTREME safety only:
+            # Block counter-trend trades when ALL timeframes (strength 3/3) disagree AND confidence is low.
+            # Softer cases: just log — the AI has the information to decide.
             if action in ("BUY", "SELL") and trend_info:
                 trend_dir = trend_info["direction"]
                 trend_str = trend_info["strength"]
-                _min_trend_str = 3 if _is_crypto_symbol() else 2  # crypto: only block if ALL TFs disagree
-                _min_counter_conf = 7 if _is_crypto_symbol() else 8
-                if trend_dir != "MIXED" and trend_dir != action and trend_str >= _min_trend_str:
-                    confidence = _extract_confidence(analysis)
-                    if confidence < _min_counter_conf:
+                confidence = _extract_confidence(analysis)
+                if trend_dir != "MIXED" and trend_dir != action:
+                    if trend_str >= 3 and confidence < 7:
+                        # ALL 3 timeframes oppose + low confidence = hard block
                         print(
-                            f"[TREND] ⚠️ AI says {action} but trend is {trend_dir} "
-                            f"(strength {trend_str}/3), confidence {confidence} < {_min_counter_conf} → WAIT"
+                            f"[TREND] 🛑 {action} blocked: ALL TFs trend {trend_dir} "
+                            f"(strength 3/3), conf={confidence} < 7 → WAIT"
                         )
-                        log_event("TREND_FILTER", f"Blocked {action} — trend={trend_dir} str={trend_str} conf={confidence}")
+                        log_event("TREND_FILTER", f"Blocked {action} — trend={trend_dir} str=3 conf={confidence}")
                         action = "WAIT"
                     else:
-                        print(f"[TREND] AI {action} against trend {trend_dir} but confidence {confidence} >= {_min_counter_conf} — allowing")
+                        # Softer: just log, trust AI's decision
+                        print(f"[TREND] ℹ️ {action} vs trend {trend_dir} (str={trend_str}/3) — AI conf={confidence}, trusting AI")
 
-            # ---- S/R Room-to-Move filter ----
-            # Don't enter if there's not enough room to reach TP before hitting S/R
-            # Crypto: 40% room required (H1 S/R ranges are tighter vs ATR-based TP)
-            # Gold:   60% room required (standard)
+            # ---- S/R Room-to-Move info (AI context, not hard block) ----
+            # AI already receives S/R levels in technical summary. Log room-to-move for transparency.
+            # Only hard-block when room is critically small (< 20% of TP) — a clear trap.
             if action in ("BUY", "SELL") and candles_h1 and len(candles_h1) >= 20:
                 sr_h1 = calc_support_resistance(candles_h1, 20)
                 if sr_h1:
                     current_mid = (bid + ask) / 2
-                    tp_distance_usd = tp_points * POINT_SIZE  # convert points to USD
-                    _sr_room_pct = 0.4 if _is_crypto_symbol() else 0.6
-                    _sr_override_conf = 7 if _is_crypto_symbol() else 8
-                    _sr_room_label = f"{int(_sr_room_pct * 100)}%"
+                    tp_distance_usd = tp_points * POINT_SIZE
                     if action == "BUY":
                         room_to_resist = sr_h1["resistance"] - current_mid
-                        if room_to_resist < tp_distance_usd * _sr_room_pct:
+                        room_pct = room_to_resist / tp_distance_usd if tp_distance_usd > 0 else 1
+                        if room_pct < 0.20:
                             confidence = _extract_confidence(analysis)
-                            if confidence < _sr_override_conf:
+                            if confidence < 8:
                                 print(
-                                    f"[S/R] ⚠️ BUY blocked: only ${room_to_resist:.2f} room to resistance "
-                                    f"{sr_h1['resistance']}, need ${tp_distance_usd * _sr_room_pct:.2f} ({_sr_room_label} of TP), conf={confidence} → WAIT"
+                                    f"[S/R] 🛑 BUY blocked: only ${room_to_resist:.2f} room to resistance "
+                                    f"{sr_h1['resistance']} ({room_pct:.0%} of TP) — trap zone, conf={confidence} → WAIT"
                                 )
-                                log_event("SR_FILTER", f"BUY blocked: room={room_to_resist:.2f} < TP*{_sr_room_pct}={tp_distance_usd*_sr_room_pct:.2f}")
+                                log_event("SR_FILTER", f"BUY blocked: room={room_to_resist:.2f} ({room_pct:.0%} of TP)")
                                 action = "WAIT"
+                        elif room_pct < 0.50:
+                            print(
+                                f"[S/R] ℹ️ BUY: ${room_to_resist:.2f} room to resistance "
+                                f"{sr_h1['resistance']} ({room_pct:.0%} of TP) — AI has context, trusting decision"
+                            )
                     elif action == "SELL":
                         room_to_support = current_mid - sr_h1["support"]
-                        if room_to_support < tp_distance_usd * _sr_room_pct:
+                        room_pct = room_to_support / tp_distance_usd if tp_distance_usd > 0 else 1
+                        if room_pct < 0.20:
                             confidence = _extract_confidence(analysis)
-                            if confidence < _sr_override_conf:
+                            if confidence < 8:
                                 print(
-                                    f"[S/R] ⚠️ SELL blocked: only ${room_to_support:.2f} room to support "
-                                    f"{sr_h1['support']}, need ${tp_distance_usd * _sr_room_pct:.2f} ({_sr_room_label} of TP), conf={confidence} → WAIT"
+                                    f"[S/R] 🛑 SELL blocked: only ${room_to_support:.2f} room to support "
+                                    f"{sr_h1['support']} ({room_pct:.0%} of TP) — trap zone, conf={confidence} → WAIT"
                                 )
-                                log_event("SR_FILTER", f"SELL blocked: room={room_to_support:.2f} < TP*{_sr_room_pct}={tp_distance_usd*_sr_room_pct:.2f}")
+                                log_event("SR_FILTER", f"SELL blocked: room={room_to_support:.2f} ({room_pct:.0%} of TP)")
                                 action = "WAIT"
+                        elif room_pct < 0.50:
+                            print(
+                                f"[S/R] ℹ️ SELL: ${room_to_support:.2f} room to support "
+                                f"{sr_h1['support']} ({room_pct:.0%} of TP) — AI has context, trusting decision"
+                            )
 
             # ---- Direction Bias SAFETY NET ----
             # The AI now receives full bias + trend + P/L context in its prompt,
