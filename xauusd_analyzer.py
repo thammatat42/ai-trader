@@ -4075,14 +4075,26 @@ def main_loop():
                         same_dir_pct = action_data["count"] / total_dir * 100
                         same_dir_pnl = action_data["pnl"]
                         confidence = _extract_confidence(analysis)
+                        # If action aligns with multi-TF trend (2/3+), bias is correct trend-following → skip block
+                        trend_confirms = (
+                            trend_info
+                            and trend_info.get("direction") == action
+                            and trend_info.get("strength", 0) >= 2
+                        )
                         # Extreme safety: >90% same direction AND losing money → hard block
-                        if same_dir_pct >= 90 and same_dir_pnl < 0 and confidence < 8:
+                        # BUT NOT if the multi-TF trend confirms this direction
+                        if same_dir_pct >= 90 and same_dir_pnl < 0 and confidence < 8 and not trend_confirms:
                             print(
                                 f"[BIAS] 🛑 {action} blocked (safety net): {same_dir_pct:.0f}% of {total_dir} "
                                 f"trades are {action} AND net P/L=${same_dir_pnl:+.2f} (losing), conf={confidence} < 8 → WAIT"
                             )
                             log_event("BIAS_FILTER", f"{action} extreme bias {same_dir_pct:.0f}%, net_pnl={same_dir_pnl:+.2f}, conf={confidence}")
                             action = "WAIT"
+                        elif same_dir_pct >= 90 and same_dir_pnl < 0 and trend_confirms:
+                            print(
+                                f"[BIAS] ℹ️ {action} bias {same_dir_pct:.0f}% (net ${same_dir_pnl:+.2f}) but "
+                                f"trend confirms {action} ({trend_info['strength']}/3) — allowing trade"
+                            )
                         elif same_dir_pct > 75:
                             # Soft warning — AI already has this context, just log it
                             print(
