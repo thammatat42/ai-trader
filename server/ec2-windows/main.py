@@ -203,11 +203,21 @@ def execute_trade(req: TradeRequest):
     else:
         return {"error": f"Invalid action: {req.action}. Use BUY or SELL.", "success": False}
 
+    # Validate & round volume to broker's allowed step
+    vol_min  = symbol_info.volume_min
+    vol_max  = symbol_info.volume_max
+    vol_step = symbol_info.volume_step
+    volume   = max(vol_min, min(vol_max, req.lot))
+    # Round to nearest valid step
+    if vol_step > 0:
+        volume = round(round(volume / vol_step) * vol_step, 10)
+    volume = round(volume, 2)
+
     # สร้าง order request
     trade_request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": req.symbol,
-        "volume": req.lot,
+        "volume": volume,
         "type": order_type,
         "price": price,
         "sl": req.sl,
@@ -218,6 +228,8 @@ def execute_trade(req: TradeRequest):
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+
+    print(f"[TRADE] {req.action} {req.symbol} vol={volume} (requested={req.lot}, min={vol_min}, step={vol_step}) price={price} sl={req.sl} tp={req.tp}")
 
     # ส่งคำสั่ง
     result = mt5.order_send(trade_request)
