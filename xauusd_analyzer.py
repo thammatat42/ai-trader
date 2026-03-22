@@ -3623,6 +3623,7 @@ def main_loop():
             continue
 
         try:
+            _cycle_t0 = time.time()
             print(f"\n=== 🟢 AI Trader Node | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
             # ---- VPS health check (circuit breaker) ----
@@ -3687,6 +3688,7 @@ def main_loop():
                 continue
 
             # ---- Fetch candles ----
+            _t_candles = time.time()
             print(f"[INFO] Fetching candles ({scalp_tf}, H1, H4, D1)...")
             candles_scalp = get_candles_from_mt5(scalp_tf, 30)
             candles_h1    = get_candles_from_mt5("H1", 50)
@@ -3713,6 +3715,8 @@ def main_loop():
                     print("[CONSOLIDATION] ⚠️ Market is sideways (BB narrow + RSI neutral) — extra caution")
             else:
                 print("[WARN] Incomplete candle data – price-only analysis")
+
+            _t_candles_done = time.time()
 
             risk      = calculate_lot_size(atr_value=h1_atr)
             lot_size  = risk["lot_size"]
@@ -3743,11 +3747,13 @@ def main_loop():
                 lot_size = reduced_lot
 
             # ---- Order book ----
+            _t_ob = time.time()
             print("[INFO] Fetching Order Book...")
             ob_summary = get_orderbook_from_mt5()
             print(f"[ORDERBOOK] {ob_summary}")
 
             # ---- News ----
+            _t_news = time.time()
             print("[INFO] Fetching news & Macro Events...")
             news_summary = build_news_summary()
             if news_summary != "No significant news or events found":
@@ -3770,6 +3776,7 @@ def main_loop():
                 print(f"[TRADE LOG]\n{trade_log_summary}")
 
             # ---- AI Analysis ----
+            _t_ai = time.time()
             ai_cfg = _get_ai_config()
             print(f"[INFO] Sending to AI ({ai_cfg['provider']}: {ai_cfg['model']})...")
 
@@ -3908,7 +3915,14 @@ def main_loop():
                 d1_high=d1_high_val,
                 d1_low=d1_low_val,
             )
+            _t_ai_done = time.time()
             print(f"\n>>> 🤖 AI RESULT <<<\n{analysis}\n{'='*30}")
+            print(
+                f"[TIMING] ⏱️ Candles={_t_candles_done - _t_candles:.1f}s | "
+                f"OB+News={_t_ai - _t_ob:.1f}s | "
+                f"AI={_t_ai_done - _t_ai:.1f}s | "
+                f"Total={_t_ai_done - _cycle_t0:.1f}s"
+            )
 
             if analysis == "ERROR":
                 raise RuntimeError("AI returned ERROR")
