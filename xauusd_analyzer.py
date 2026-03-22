@@ -1255,7 +1255,8 @@ def get_auto_generated_lessons() -> str:
         """)
         for dr in cur.fetchall():
             act, pnl, cnt = dr
-            if float(pnl) < -5 and cnt >= 3:
+            _loss_threshold = -1 if _is_crypto_symbol() else -5  # crypto trades smaller
+            if float(pnl) < _loss_threshold and cnt >= 2:
                 lessons.append(
                     f"DATA: {act} trades lost ${abs(float(pnl)):.2f} in 3 days ({cnt} trades). "
                     f"LESSON: Reduce {act} frequency. Only {act} with confidence 8+ and strong trend alignment."
@@ -1265,7 +1266,7 @@ def get_auto_generated_lessons() -> str:
         cur.execute("""
             SELECT EXTRACT(HOUR FROM opened_at)::int as h, SUM(profit), COUNT(*)
             FROM trades WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '5 days'
-            GROUP BY h HAVING SUM(profit) < -3 AND COUNT(*) >= 3
+            GROUP BY h HAVING SUM(profit) < -1 AND COUNT(*) >= 2
             ORDER BY SUM(profit) ASC LIMIT 3;
         """)
         bad_hours = cur.fetchall()
@@ -1281,10 +1282,10 @@ def get_auto_generated_lessons() -> str:
             FROM trades WHERE status = 'CLOSED' AND closed_at >= NOW() - INTERVAL '3 days';
         """)
         row = cur.fetchone()
-        if row and row[2] and row[2] >= 5:
+        if row and row[2] and row[2] >= 3:
             counter_l = row[0] or 0
             with_trend_w = row[1] or 0
-            if counter_l >= 3:
+            if counter_l >= 2:
                 lessons.append(
                     f"DATA: {counter_l} counter-trend trades lost money vs {with_trend_w} with-trend wins. "
                     f"LESSON: ALWAYS trade with H1+H4 trend. Counter-trend needs confidence 9+."
@@ -2620,8 +2621,12 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                             modify_sl_mt5(ticket, ideal_sl)
 
             # ===== TREND REVERSAL EXIT =====
-            # If position is held > 2min and H1 trend has reversed, close losing positions early
-            if hold_sec >= 120 and profit <= 0:
+            # If position is held long enough and H1 trend has reversed, close losing positions early
+            # Crypto: require 5min hold (H1 EMA noise) and meaningful loss (> spread cost)
+            # Gold: 2min hold, any loss
+            _trend_exit_hold = 300 if _is_crypto_symbol() else 120
+            _trend_exit_min_loss = -1.0 if _is_crypto_symbol() else 0
+            if hold_sec >= _trend_exit_hold and profit <= _trend_exit_min_loss:
                 try:
                     candles_h1_check = get_candles_from_mt5("H1", 30)
                     if candles_h1_check and len(candles_h1_check) >= 21:
@@ -3105,7 +3110,8 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
     # Whipsaw protection: max 3 recovery attempts per hour
     # Prune attempts older than 1 hour
     _recovery_attempts_recent[:] = [ts for ts, _ in _recovery_attempts_recent if now - ts < 3600]
-    if len(_recovery_attempts_recent) >= 3:
+    _max_recovery = 5 if _is_crypto_symbol() else 3  # crypto trades 24/7, allow more recovery attempts
+    if len(_recovery_attempts_recent) >= _max_recovery:
         print(f"[RECOVERY] ⛔ Whipsaw protection: {len(_recovery_attempts_recent)} recovery attempts in last hour — pausing")
         log_event("RECOVERY_WHIPSAW", f"{len(_recovery_attempts_recent)} attempts in 1hr")
         return False
@@ -3272,6 +3278,7 @@ def attempt_recovery_trade(symbol: str, scalp_tf: str):
                 sl_price=sl_price,
                 tp_price=tp_price,
                 ai_confidence=confidence if isinstance(confidence, int) else None,
+                trend_direction=trend_dir if trend_dir else None,
             )
             return True
         else:
@@ -3308,6 +3315,7 @@ def main_loop():
     consecutive_errors = 0
     pause_retries      = 0
     _last_market_log   = None
+    _skip_loss_check   = False  # skip loss check for 1 cycle after pause (prevent infinite loop)
 
     while not _shutdown:
         # ---- Market hours check ----
@@ -3366,7 +3374,7 @@ def main_loop():
         LOSS_PAUSE_THRESHOLD = int(os.getenv("LOSS_PAUSE_THRESHOLD", 3))
         LOSS_PAUSE_SEC       = int(os.getenv("LOSS_PAUSE_SEC",    1800))
         consec_losses = get_consecutive_losses()
-        if consec_losses >= LOSS_PAUSE_THRESHOLD:
+        if consec_losses >= LOSS_PAUSE_THRESHOLD and not _skip_loss_check:
             print(f"[SAFETY] ⚠️ {consec_losses} consecutive losses – attempting recovery analysis...")
             log_event("LOSS_PAUSE", f"{consec_losses} consecutive losses – running recovery")
             sync_closed_trades()
@@ -3374,12 +3382,18 @@ def main_loop():
             scalp_tf = os.getenv("SCALP_TIMEFRAME", "M5")
             recovered = attempt_recovery_trade(symbol, scalp_tf)
             if not recovered:
-                print(f"[SAFETY] Recovery declined — pausing {LOSS_PAUSE_SEC}s")
+                print(f"[SAFETY] Recovery declined — pausing {LOSS_PAUSE_SEC}s then resuming normal trading")
                 time.sleep(LOSS_PAUSE_SEC)
             else:
                 # Recovery trade opened, wait shorter cooldown then continue
                 time.sleep(60)
+            # Skip loss check next cycle so bot can actually trade and break the streak
+            _skip_loss_check = True
             continue
+        elif _skip_loss_check:
+            # One free cycle after loss pause — allow normal trading to potentially win
+            print(f"[SAFETY] ℹ️ Post-pause cycle: {consec_losses} losses still in DB, allowing 1 normal trade attempt")
+            _skip_loss_check = False
 
         # FIX #12: Drawdown protection check
         dd_safe, dd_reason = check_max_drawdown()
