@@ -2237,7 +2237,9 @@ FRIDAY_NO_NEW_TRADE_MINUTES = int(os.getenv("FRIDAY_NO_NEW_TRADE_MINUTES", 60))
 # 3-Phase Adaptive Trailing Stop (ATR multipliers)
 # WIDER GAPS = let winners run to meaningful profit
 # Phase 1: Small profit — protect entry but give room to breathe
-TRAIL_PHASE1_ATR = float(os.getenv("TRAIL_PHASE1_ATR", 0.50))
+TRAIL_PHASE1_ATR = float(os.getenv("TRAIL_PHASE1_ATR", 0.38))
+# Progressive tightening: when price moves > this many ATRs, start tightening trail
+TRAIL_TIGHTEN_ATR_TRIGGER = float(os.getenv("TRAIL_TIGHTEN_ATR_TRIGGER", 1.5))
 # Phase 2: Good profit (>= min_profit_close) — wider trail, let it develop
 TRAIL_PHASE2_ATR = float(os.getenv("TRAIL_PHASE2_ATR", 0.75))
 # Phase 3: After partial close (already banked 50%) — widest, let runner go
@@ -2692,6 +2694,12 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     _position_max_profit[ticket] = profit
                 max_profit_seen = _position_max_profit.get(ticket, 0)
 
+            # Pre-compute distance from entry for trailing logic
+            if pos_type == "BUY":
+                distance = current_price - open_price
+            else:
+                distance = open_price - current_price
+
             is_partial = ticket in _partial_closed
             if is_partial:
                 trail_gap = trail_gap_p3
@@ -2703,10 +2711,21 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 trail_gap = trail_gap_p1
                 phase_label = "P1-PROTECT"
 
-            # High watermark protection: if profit dropped >65% from peak, tighten trail to P2
-            # (not P1 — P1 is too tight and causes premature exits)
-            if max_profit_seen > 0 and profit > 0 and profit < max_profit_seen * 0.35:
-                trail_gap = trail_gap_p2  # tighten to P2 (not P1)
+            # Progressive tightening: as price moves further from entry, tighten trail
+            # Strong directional moves should be protected more aggressively
+            if atr and atr > 0 and distance > 0:
+                distance_in_atr = distance / atr
+                if distance_in_atr >= TRAIL_TIGHTEN_ATR_TRIGGER:
+                    tighten_factor = min(0.55, 0.30 + (distance_in_atr - TRAIL_TIGHTEN_ATR_TRIGGER) * 0.05)
+                    tight_gap = max(_trail_floor_p1 * 0.6, round(atr * tighten_factor, 2))
+                    if tight_gap < trail_gap:
+                        trail_gap = tight_gap
+                        phase_label = f"TIGHT(dist={distance_in_atr:.1f}xATR)"
+
+            # High watermark protection: if profit dropped >45% from peak, tighten trail
+            if max_profit_seen > 0 and profit > 0 and profit < max_profit_seen * 0.55:
+                if trail_gap_p2 < trail_gap:
+                    trail_gap = trail_gap_p2
                 phase_label = f"P2-PROTECT(peak${max_profit_seen:.2f})"
 
             if current_sl != 0:
