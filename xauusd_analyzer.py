@@ -2255,6 +2255,10 @@ PULLBACK_MAX_PCT       = float(os.getenv("PULLBACK_MAX_PCT", 60))      # Guarant
 PULLBACK_SCALE_PROFIT  = float(os.getenv("PULLBACK_SCALE_PROFIT", 20)) # Profit ($) where max guarantee % kicks in
 # Trail gap absolute cap (USD) — prevents ATR from making gap too wide on micro accounts (0=disabled)
 TRAIL_GAP_MAX          = float(os.getenv("TRAIL_GAP_MAX", 0))
+# AI forecast minimum profit to allow CLOSE when trade is WITH the trend
+# Prevents cheap forecast model from panic-closing $1.80 winners in a 3/3 downtrend
+# 0 = disabled (AI can close at any profit)
+AI_CLOSE_MIN_PROFIT    = float(os.getenv("AI_CLOSE_MIN_PROFIT", 0))
 
 _friday_closed: bool = False  # Flag to prevent repeated Friday close attempts
 
@@ -2921,6 +2925,9 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                         h1d = "UP" if e9_h1 and e21_h1 and e9_h1 > e21_h1 else "DOWN" if e9_h1 and e21_h1 else "?"
                         h4d = "UP" if e9_h4 and e21_h4 and e9_h4 > e21_h4 else "DOWN" if e9_h4 and e21_h4 else "?"
                         _fc_trend = f"H1={h1d} H4={h4d}"
+                        # Track trend alignment for with-trend protection
+                        smart_position_monitor._fc_h1d = h1d
+                        smart_position_monitor._fc_h4d = h4d
                 except Exception:
                     pass
                 try:
@@ -2965,6 +2972,17 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                 )
                 print(f"[SMART] 💰 #{ticket} {pos_type} | {hold_sec}s | ${profit:.2f} | AI: {forecast['action']} — {forecast['reason']}")
                 if forecast["action"] == "CLOSE":
+                    # With-trend protection: don't let forecast AI close small-profit trades
+                    # when the trade direction matches H1+H4 trend (the entry AI was right)
+                    if AI_CLOSE_MIN_PROFIT > 0 and profit > 0 and profit < AI_CLOSE_MIN_PROFIT:
+                        _h1d = getattr(smart_position_monitor, '_fc_h1d', '?')
+                        _h4d = getattr(smart_position_monitor, '_fc_h4d', '?')
+                        _pos_trend = "UP" if pos_type == "BUY" else "DOWN"
+                        _trend_match = (_h1d == _pos_trend) + (_h4d == _pos_trend)
+                        if _trend_match >= 1:  # At least H1 or H4 agrees
+                            print(f"[SMART] 🛡️ #{ticket} AI says CLOSE at ${profit:.2f} but < min ${AI_CLOSE_MIN_PROFIT:.2f} "
+                                  f"& WITH trend (H1={_h1d} H4={_h4d}) → HOLD (trust entry AI)")
+                            continue
                     # Re-check profit before closing — price can move during AI call (787ms+)
                     # With large lots, even $0.30 move = big P/L swing
                     try:
