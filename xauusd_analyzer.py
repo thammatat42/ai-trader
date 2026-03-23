@@ -2824,12 +2824,6 @@ def smart_position_monitor(scalp_tf: str = "M15"):
             # ===== TIME + AI FORECAST DECISIONS =====
             if hold_sec < MIN_HOLD_SEC:
                 continue
-            if profit <= 0 and hold_sec < MAX_HOLD_SEC_LOSS:
-                # Even when losing, check more often if hold time is getting long
-                if hold_sec > MAX_HOLD_SEC_LOSS * 0.7:
-                    pass  # fall through to AI forecast
-                else:
-                    continue
 
             # FIX #2: use lock when reading/writing _forecast_cooldown
             with _forecast_lock:
@@ -2901,17 +2895,10 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     close_position_mt5(ticket)
                 continue
 
-            # AI profit-taking: two paths
-            # 1. Percentage-based (original): profit >= 0.5% of balance
-            # 2. Absolute-dollar (new): profit >= $0.50 after MIN_HOLD_SEC — for small lots
-            #    This ensures AI manages positions even when lot size is tiny
-            _abs_profit_threshold = 0.50 if _is_crypto_symbol() else 2.0
-            _should_check_profit = (
-                (profit >= min_profit_close and hold_sec >= MIN_HOLD_SEC) or  # %-based
-                (profit >= _abs_profit_threshold and hold_sec >= MIN_HOLD_SEC)  # absolute
-            )
-
-            if _should_check_profit:
+            # AI forecast for ALL positions after MIN_HOLD_SEC
+            # Profitable: AI decides HOLD/CLOSE based on momentum + S/R
+            # Losing: AI decides whether to cut early or hold for recovery
+            if profit > 0 or hold_sec >= MIN_HOLD_SEC:
                 forecast = ai_quick_forecast(
                     candles_scalp, current_price, pos_type, profit, scalp_tf,
                     open_price=open_price, hold_sec=hold_sec,
@@ -2936,28 +2923,6 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                         pass  # If re-check fails, proceed with close (original decision still valid)
                     close_position_mt5(ticket)
                     continue
-
-            # Check losing positions approaching max hold (70-100% of MAX_HOLD_SEC_LOSS)
-            # Only ask AI if loss is significant relative to SL distance
-            # This prevents premature exits on positions where SL gives plenty of room
-            if profit <= 0 and hold_sec > MAX_HOLD_SEC_LOSS * 0.7:
-                # Calculate how much of the SL room has been used
-                _price_against = abs(current_price - open_price)
-                _sl_room_total = abs(current_sl - open_price) if current_sl > 0 else 999
-                _sl_used_pct = (_price_against / _sl_room_total * 100) if _sl_room_total > 0 else 0
-
-                if _sl_used_pct < 30 and hold_sec < MAX_HOLD_SEC_LOSS * 0.9:
-                    # Loss is small relative to SL — price is oscillating normally, skip AI check
-                    pass
-                else:
-                    forecast = ai_quick_forecast(
-                        candles_scalp, current_price, pos_type, profit, scalp_tf,
-                        open_price=open_price, hold_sec=hold_sec,
-                        news_alert=_fc_news, trend_summary=_fc_trend, win_rate_summary=_fc_wr,
-                    )
-                    print(f"[SMART] ⚠️ #{ticket} losing ${profit:.2f} at {hold_sec}s (SL {_sl_used_pct:.0f}% used) | AI: {forecast['action']} — {forecast['reason']}")
-                    if forecast["action"] == "CLOSE":
-                        close_position_mt5(ticket)
 
         # Cleanup stale entries
         open_tickets = {p["ticket"] for p in positions}
