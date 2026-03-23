@@ -3639,6 +3639,7 @@ def main_loop():
             print(f"[TIME] ⏰ Hour {current_hour_utc:02d} UTC in bad-hours {BAD_HOURS_UTC} – sleeping {sleep_sec}s (~{minutes_left}min to next hour)")
             sync_closed_trades()
             time.sleep(sleep_sec)
+            print(f"[TIME] ✅ Bad-hours sleep done — resuming trading at {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
             continue
 
         # ---- Consecutive loss pause (with recovery attempt) ----
