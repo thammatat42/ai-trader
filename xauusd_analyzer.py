@@ -2247,6 +2247,15 @@ TRAIL_PHASE3_ATR = float(os.getenv("TRAIL_PHASE3_ATR", 1.00))
 # Breakeven trigger distance in USD (price must move this far before SL→entry)
 BREAKEVEN_DISTANCE = float(os.getenv("BREAKEVEN_DISTANCE", 1.00))
 
+# Pullback Protection: ratchet SL to guarantee a % of peak profit
+# Prevents $10-15 unrealized profit from evaporating to $1.50 on volatile swings
+PULLBACK_ACTIVATE      = float(os.getenv("PULLBACK_ACTIVATE", 3.0))    # Min peak profit ($) to activate
+PULLBACK_MIN_PCT       = float(os.getenv("PULLBACK_MIN_PCT", 30))      # Guarantee % at activation threshold
+PULLBACK_MAX_PCT       = float(os.getenv("PULLBACK_MAX_PCT", 60))      # Guarantee % at max profit level
+PULLBACK_SCALE_PROFIT  = float(os.getenv("PULLBACK_SCALE_PROFIT", 20)) # Profit ($) where max guarantee % kicks in
+# Trail gap absolute cap (USD) — prevents ATR from making gap too wide on micro accounts (0=disabled)
+TRAIL_GAP_MAX          = float(os.getenv("TRAIL_GAP_MAX", 0))
+
 _friday_closed: bool = False  # Flag to prevent repeated Friday close attempts
 
 _cached_balance:    float | None = None
@@ -2410,12 +2419,22 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
     macd      = calc_macd(closes) if len(closes) >= 35 else None
     bb        = calc_bollinger(closes) if len(closes) >= 20 else None
 
-    # Quick momentum check — close immediately on fast adverse moves
-    if len(closes) >= 3:
+    # Quick momentum check — close on sustained adverse moves
+    # Threshold scales with ATR to handle volatile instruments (gold, BTC)
+    # Skip for young trades (<30s) — trust the entry AI's decision
+    _momentum_thresh = max(1.5, round(atr * 0.80, 2)) if atr else 1.5
+    if hold_sec >= 30 and open_price > 0:
+        # Use actual position movement (current price vs entry)
+        _pos_move = current_price - open_price
+        if position_type == "BUY" and _pos_move < -_momentum_thresh:
+            return {"action": "CLOSE", "reason": f"Rapid drop {_pos_move:.2f} against BUY (thresh={_momentum_thresh})"}
+        if position_type == "SELL" and _pos_move > _momentum_thresh:
+            return {"action": "CLOSE", "reason": f"Rapid rise +{_pos_move:.2f} against SELL (thresh={_momentum_thresh})"}
+    elif hold_sec >= 30 and len(closes) >= 3:
         recent_move = closes[-1] - closes[-3]
-        if position_type == "BUY" and recent_move < -1.5:
+        if position_type == "BUY" and recent_move < -_momentum_thresh:
             return {"action": "CLOSE", "reason": f"Rapid drop {recent_move:.2f} against BUY"}
-        if position_type == "SELL" and recent_move > 1.5:
+        if position_type == "SELL" and recent_move > _momentum_thresh:
             return {"action": "CLOSE", "reason": f"Rapid rise +{recent_move:.2f} against SELL"}
 
     # Technical-only close signals (no AI call needed)
@@ -2425,14 +2444,15 @@ def ai_quick_forecast(candles_scalp: list, current_price: float,
         if position_type == "SELL" and rsi < 22 and profit > 0:
             return {"action": "CLOSE", "reason": f"RSI oversold {rsi} — take profit on SELL"}
 
-    # S/R proximity check
+    # S/R proximity check — scale by ATR for instrument volatility
+    _sr_proximity = max(0.5, round(atr * 0.05, 2)) if atr else 0.5
     if sr:
         dist_to_resist = sr["resistance"] - current_price
         dist_to_support = current_price - sr["support"]
-        if position_type == "BUY" and dist_to_resist < 0.5 and profit > 0:
-            return {"action": "CLOSE", "reason": f"Near resistance {sr['resistance']} — take profit"}
-        if position_type == "SELL" and dist_to_support < 0.5 and profit > 0:
-            return {"action": "CLOSE", "reason": f"Near support {sr['support']} — take profit"}
+        if position_type == "BUY" and dist_to_resist < _sr_proximity and profit > 0:
+            return {"action": "CLOSE", "reason": f"Near resistance {sr['resistance']} (dist={dist_to_resist:.2f}) — take profit"}
+        if position_type == "SELL" and dist_to_support < _sr_proximity and profit > 0:
+            return {"action": "CLOSE", "reason": f"Near support {sr['support']} (dist={dist_to_support:.2f}) — take profit"}
 
     last_10 = candles_scalp[-10:]
     candle_str = " ".join(
@@ -2628,8 +2648,8 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
             # ===== PROFIT LOCK (tighten SL → let winners run) =====
             # Was hard-close — now locks gains via SL and lets trade continue.
-            # Floor: profit must reach 0.5× ATR before locking (prevents noise-level exits on micro accounts)
-            _pl_floor = round(atr * 0.50, 2) if atr else 0
+            # Floor: profit must reach 0.25× ATR before locking
+            _pl_floor = round(atr * 0.25, 2) if atr else 0
             _effective_pl = max(profit_lock_usd, _pl_floor) if profit_lock_usd > 0 else 0
             if _effective_pl > 0 and profit >= _effective_pl:
                 _price_move = abs(current_price - open_price)
@@ -2640,12 +2660,14 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                         if lock_sl > current_sl and lock_sl > open_price:
                             print(f"[SMART] 💰💰 #{ticket} profit=${profit:.2f} >= ${_effective_pl:.2f} → LOCK SL {current_sl}→{lock_sl} (gap=${_lock_gap:.2f})")
                             modify_sl_mt5(ticket, lock_sl)
+                            current_sl = lock_sl  # Update for subsequent checks
                             log_event("PROFIT_LOCK", f"#{ticket} SL→{lock_sl} gap={_lock_gap}")
                     elif pos_type == "SELL":
                         lock_sl = round(current_price + _lock_gap, 2)
                         if (lock_sl < current_sl or current_sl <= 0) and lock_sl < open_price:
                             print(f"[SMART] 💰💰 #{ticket} profit=${profit:.2f} >= ${_effective_pl:.2f} → LOCK SL {current_sl}→{lock_sl} (gap=${_lock_gap:.2f})")
                             modify_sl_mt5(ticket, lock_sl)
+                            current_sl = lock_sl  # Update for subsequent checks
                             log_event("PROFIT_LOCK", f"#{ticket} SL→{lock_sl} gap={_lock_gap}")
                 # No close — trailing stop + AI forecast manage the exit
 
@@ -2710,6 +2732,33 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     _position_max_profit[ticket] = profit
                 max_profit_seen = _position_max_profit.get(ticket, 0)
 
+            # ===== PULLBACK PROTECTION =====
+            # Guarantee a scaling % of peak profit via SL ratcheting
+            # Prevents $10-15 unrealized profit from evaporating on volatile swings
+            if max_profit_seen >= PULLBACK_ACTIVATE and profit > 0:
+                _pb_scale = min(1.0, (max_profit_seen - PULLBACK_ACTIVATE) / max(1, PULLBACK_SCALE_PROFIT - PULLBACK_ACTIVATE))
+                _pb_pct = (PULLBACK_MIN_PCT + _pb_scale * (PULLBACK_MAX_PCT - PULLBACK_MIN_PCT)) / 100
+                _pb_guaranteed = round(max_profit_seen * _pb_pct, 2)
+                _pb_dist = abs(current_price - open_price)
+                if _pb_dist > 0:
+                    _pb_ppu = profit / _pb_dist  # profit per $1 price move
+                    if _pb_ppu > 0:
+                        _pb_sl_dist = _pb_guaranteed / _pb_ppu
+                        if pos_type == "BUY":
+                            _pb_sl = round(open_price + _pb_sl_dist, 2)
+                            if _pb_sl > current_sl and _pb_sl > open_price:
+                                print(f"[PULLBACK] 🛡️ #{ticket} peak=${max_profit_seen:.2f} now=${profit:.2f} → guarantee ${_pb_guaranteed:.2f} ({_pb_pct*100:.0f}%) SL {current_sl}→{_pb_sl}")
+                                modify_sl_mt5(ticket, _pb_sl)
+                                current_sl = _pb_sl
+                                log_event("PULLBACK_LOCK", f"#{ticket} peak=${max_profit_seen:.2f} guarantee=${_pb_guaranteed:.2f} SL→{_pb_sl}")
+                        elif pos_type == "SELL":
+                            _pb_sl = round(open_price - _pb_sl_dist, 2)
+                            if (_pb_sl < current_sl or current_sl <= 0) and _pb_sl < open_price:
+                                print(f"[PULLBACK] 🛡️ #{ticket} peak=${max_profit_seen:.2f} now=${profit:.2f} → guarantee ${_pb_guaranteed:.2f} ({_pb_pct*100:.0f}%) SL {current_sl}→{_pb_sl}")
+                                modify_sl_mt5(ticket, _pb_sl)
+                                current_sl = _pb_sl
+                                log_event("PULLBACK_LOCK", f"#{ticket} peak=${max_profit_seen:.2f} guarantee=${_pb_guaranteed:.2f} SL→{_pb_sl}")
+
             # Pre-compute distance from entry for trailing logic
             if pos_type == "BUY":
                 distance = current_price - open_price
@@ -2740,9 +2789,17 @@ def smart_position_monitor(scalp_tf: str = "M15"):
 
             # High watermark protection: if profit dropped >45% from peak, tighten trail
             if max_profit_seen > 0 and profit > 0 and profit < max_profit_seen * 0.55:
-                if trail_gap_p2 < trail_gap:
-                    trail_gap = trail_gap_p2
-                phase_label = f"P2-PROTECT(peak${max_profit_seen:.2f})"
+                _hwm_dd = 1.0 - (profit / max_profit_seen)
+                _hwm_factor = max(0.4, 1.0 - _hwm_dd)
+                _hwm_gap = max(_trail_floor_p1 * 0.5, round(trail_gap_p1 * _hwm_factor, 2))
+                if _hwm_gap < trail_gap:
+                    trail_gap = _hwm_gap
+                phase_label = f"HWM-PROTECT(peak${max_profit_seen:.2f},dd={_hwm_dd:.0%})"
+
+            # Trail gap absolute cap — prevent ATR making gap too wide on micro accounts
+            if TRAIL_GAP_MAX > 0 and trail_gap > TRAIL_GAP_MAX:
+                trail_gap = TRAIL_GAP_MAX
+                phase_label += f"[CAP${TRAIL_GAP_MAX:.1f}]"
 
             if current_sl != 0:
                 # Dynamic breakeven offset: ATR×0.15 — scaled by instrument
