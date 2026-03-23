@@ -2626,12 +2626,28 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     log_event("SPIKE_CLOSE", f"#{ticket} SELL spike +{price_delta:.2f}")
                     continue
 
-            # ===== PROFIT LOCK (hard cap) =====
-            if profit_lock_usd > 0 and profit >= profit_lock_usd:
-                print(f"[SMART] 💰💰 #{ticket} profit=${profit:.2f} >= ${profit_lock_usd:.2f} → AUTO CLOSE")
-                close_position_mt5(ticket)
-                log_event("PROFIT_LOCK", f"#{ticket} closed at ${profit:.2f}")
-                continue
+            # ===== PROFIT LOCK (tighten SL → let winners run) =====
+            # Was hard-close — now locks gains via SL and lets trade continue.
+            # Floor: profit must reach 0.5× ATR before locking (prevents noise-level exits on micro accounts)
+            _pl_floor = round(atr * 0.50, 2) if atr else 0
+            _effective_pl = max(profit_lock_usd, _pl_floor) if profit_lock_usd > 0 else 0
+            if _effective_pl > 0 and profit >= _effective_pl:
+                _price_move = abs(current_price - open_price)
+                if _price_move > 0:
+                    _lock_gap = max(_trail_floor_p1, round(atr * 0.25, 2)) if atr else _trail_floor_p1
+                    if pos_type == "BUY":
+                        lock_sl = round(current_price - _lock_gap, 2)
+                        if lock_sl > current_sl and lock_sl > open_price:
+                            print(f"[SMART] 💰💰 #{ticket} profit=${profit:.2f} >= ${_effective_pl:.2f} → LOCK SL {current_sl}→{lock_sl} (gap=${_lock_gap:.2f})")
+                            modify_sl_mt5(ticket, lock_sl)
+                            log_event("PROFIT_LOCK", f"#{ticket} SL→{lock_sl} gap={_lock_gap}")
+                    elif pos_type == "SELL":
+                        lock_sl = round(current_price + _lock_gap, 2)
+                        if (lock_sl < current_sl or current_sl <= 0) and lock_sl < open_price:
+                            print(f"[SMART] 💰💰 #{ticket} profit=${profit:.2f} >= ${_effective_pl:.2f} → LOCK SL {current_sl}→{lock_sl} (gap=${_lock_gap:.2f})")
+                            modify_sl_mt5(ticket, lock_sl)
+                            log_event("PROFIT_LOCK", f"#{ticket} SL→{lock_sl} gap={_lock_gap}")
+                # No close — trailing stop + AI forecast manage the exit
 
             # ===== PARTIAL CLOSE (first target) =====
             if ticket not in _partial_closed and profit >= partial_close_usd and lot >= 0.02:
