@@ -2885,14 +2885,12 @@ def smart_position_monitor(scalp_tf: str = "M15"):
                     close_position_mt5(ticket)
                 continue
 
-            # AI profit-taking: two paths
-            # 1. Percentage-based (original): profit >= 0.5% of balance
-            # 2. Absolute-dollar (new): profit >= $0.50 after MIN_HOLD_SEC — for small lots
-            #    This ensures AI manages positions even when lot size is tiny
-            _abs_profit_threshold = 0.50 if _is_crypto_symbol() else 2.0
+            # AI profit-taking: triggers AI forecast when position is in profit
+            # Uses MIN_PROFIT_CLOSE_PCT (% of balance) as the threshold
+            # For micro accounts ($100 @ 0.01 lot): 0.5% = $0.50 — triggers at $0.50 profit
+            # For large accounts ($136K @ 40 lot): 0.5% = $680 — triggers at $680 profit
             _should_check_profit = (
-                (profit >= min_profit_close and hold_sec >= MIN_HOLD_SEC) or  # %-based
-                (profit >= _abs_profit_threshold and hold_sec >= MIN_HOLD_SEC)  # absolute
+                profit >= min_profit_close and hold_sec >= MIN_HOLD_SEC
             )
 
             if _should_check_profit:
